@@ -83,7 +83,7 @@ fn matmul_forward(
     out: &mut [f32],
     inp: &[f32],
     weight: &[f32],
-    bias: &[f32],
+    bias: Option<&[f32]>, // option because we may have None
     b: usize,
     t: usize,
     c: usize,
@@ -101,8 +101,10 @@ fn matmul_forward(
 
             for o in 0..oc {
                 let wrow_start_idx = o * c;
-                let mut sum = bias[o]; // If bias is present, use it; otherwise, use 0.0
-
+                // bias
+                let default_bias = 0.0;
+                let bias_value = bias.map_or(default_bias, |b| *b.get(o).unwrap_or(&default_bias)); // double check this
+                let mut sum = bias_value;
                 for i in 0..c {
                     sum += inp[inp_start_idx + i] * weight[wrow_start_idx + i];
                 }
@@ -212,6 +214,33 @@ fn gelu_forward(out: &mut [f32], inp: &[f32], n: usize) {
         let x = inp[i];
         let cube: f32 = 0.044715 * x * x * x;
         out[i] = 0.5 * x * (1.0 + (s * (x + cube)).tanh());
+    }
+}
+
+fn softmax_forward(out: &mut [f32], logits: &[f32], b: usize, t: usize, v: usize){
+    // here Karpathy uses pragma
+    for b_idx in 0..b{
+        for t_idx in 0..t {
+            let start_idx = b_idx * t * v + t_idx * v;
+            let logits_bt = &logits[start_idx..start_idx + v];
+            let out_bt = &mut out[start_idx..start_idx + v];
+            let mut max_val = f32::NEG_INFINITY;
+            for i in 0..v {
+                if logits_bt[i] > max_val {
+                    max_val = logits_bt[i];
+                }
+            }
+            let mut sum = 0.0;
+            for i in 0..v {
+                let val = (logits_bt[i] - max_val).exp();
+                out_bt[i] = val;
+                sum += val;
+            }
+            let sum_inv = if sum == 0.0 { 0.0 } else { 1.0 / sum };
+            for i in 0..v {
+                out_bt[i] *= sum_inv;
+            }
+        }
     }
 }
 
@@ -522,12 +551,12 @@ impl GPT2 {
 
         // Cache the inputs and optionally the targets
         self.inputs = inputs.to_vec();
-        if let Some(tgts) = targets {
-            self.targets = Some(tgts.to_vec());
-        }
+        // if let Some(tgts) = targets {
+        //     self.targets = Some(tgts.to_vec());
+        // }
 
         // Call encoder_forward
-        let mut out = vec![0.0; b * t * c]; // Output tensor for the encoder
+        //let out = vec![0.0; b * t * c]; // Output tensor for the encoder
         let wte = &self.params.wte;
         let wpe = &self.params.wpe;
 
@@ -537,7 +566,7 @@ impl GPT2 {
         for l in 0..self.config.num_layers {
             // Get the residual from the previous layer
             let index_base = l * self.batch_size * self.seq_len * self.config.channels;
-            let residual: Vec<f32> = if l == 0 {
+            let mut residual: Vec<f32> = if l == 0 {
                 self.acts.encoded.clone()
             } else {
                 self.acts.residual3[index_base - self.batch_size * self.seq_len * self.config.channels..index_base].to_vec()
@@ -562,28 +591,28 @@ impl GPT2 {
             let nh = self.config.num_heads;
 
             // Activation slices for this layer
-            let l_ln1 = &self.acts.ln1[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
-            let l_ln1_mean = &self.acts.ln1_mean[base_idx..base_idx + self.batch_size * self.seq_len];
-            let l_ln1_rstd = &self.acts.ln1_rstd[base_idx..base_idx + self.batch_size * self.seq_len];
-            let l_qkv = &self.acts.qkv[base_idx * 3 * c..(base_idx + self.batch_size * self.seq_len) * 3 * c];
-            let l_atty = &self.acts.atty[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
-            let l_preatt = &self.acts.preatt[base_idx * nh * self.seq_len..(base_idx + self.batch_size * nh * self.seq_len) * self.seq_len];
-            let l_att = &self.acts.att[base_idx * nh * self.seq_len..(base_idx + self.batch_size * nh * self.seq_len) * self.seq_len];
-            let l_attproj = &self.acts.attproj[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
-            let l_residual2 = &self.acts.residual2[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
-            let l_ln2 = &self.acts.ln2[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
-            let l_ln2_mean = &self.acts.ln2_mean[base_idx..base_idx + self.batch_size * self.seq_len];
-            let l_ln2_rstd = &self.acts.ln2_rstd[base_idx..base_idx + self.batch_size * self.seq_len];
-            let l_fch = &self.acts.fch[base_idx * 4 * c..(base_idx + self.batch_size * self.seq_len) * 4 * c];
-            let l_fch_gelu = &self.acts.fch_gelu[base_idx * 4 * c..(base_idx + self.batch_size * self.seq_len) * 4 * c];
-            let l_fcproj = &self.acts.fcproj[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
-            let l_residual3 = &self.acts.residual3[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
+            let l_ln1 = &mut self.acts.ln1[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
+            let l_ln1_mean = &mut self.acts.ln1_mean[base_idx..base_idx + self.batch_size * self.seq_len];
+            let l_ln1_rstd = &mut self.acts.ln1_rstd[base_idx..base_idx + self.batch_size * self.seq_len];
+            let l_qkv = &mut self.acts.qkv[base_idx * 3 * c..(base_idx + self.batch_size * self.seq_len) * 3 * c];
+            let l_atty = &mut self.acts.atty[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
+            let l_preatt = &mut self.acts.preatt[base_idx * nh * self.seq_len..(base_idx + self.batch_size * nh * self.seq_len) * self.seq_len];
+            let l_att = &mut self.acts.att[base_idx * nh * self.seq_len..(base_idx + self.batch_size * nh * self.seq_len) * self.seq_len];
+            let l_attproj = &mut self.acts.attproj[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
+            let l_residual2 = &mut self.acts.residual2[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
+            let l_ln2 = &mut self.acts.ln2[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
+            let l_ln2_mean = &mut self.acts.ln2_mean[base_idx..base_idx + self.batch_size * self.seq_len];
+            let l_ln2_rstd = &mut self.acts.ln2_rstd[base_idx..base_idx + self.batch_size * self.seq_len];
+            let l_fch = &mut self.acts.fch[base_idx * 4 * c..(base_idx + self.batch_size * self.seq_len) * 4 * c];
+            let l_fch_gelu = &mut self.acts.fch_gelu[base_idx * 4 * c..(base_idx + self.batch_size * self.seq_len) * 4 * c];
+            let l_fcproj = &mut self.acts.fcproj[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
+            let l_residual3 = &mut self.acts.residual3[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
 
             // FORWARD PASS
             layernorm_forward(
-                &mut l_ln1,
-                &mut l_ln1_mean,
-                &mut l_ln1_rstd,
+                 l_ln1,
+                 l_ln1_mean,
+                 l_ln1_rstd,
                 & mut residual,
                 &l_ln1w,  // weight for layernorm
                 &l_ln1b,  // bias for layernorm
@@ -592,42 +621,42 @@ impl GPT2 {
                 self.config.channels
             );
             matmul_forward(
-                &mut l_qkv,
+                l_qkv,
                 l_ln1,      // Input
                 l_qkvw,     // Weights
-                l_qkvb,     // Bias
+                Some(l_qkvb),     // Bias
                 b,
                 t,
                 c,
                 3*c
             );
             attention_forward(
-                &mut l_atty,
-                &mut l_preatt,
-                &mut l_att,
+                l_atty,
+                l_preatt,
+                l_att,
                 l_qkv,
                 b,
                 t,
                 c,
                 nh);
             matmul_forward(
-                &mut l_attproj,
+                l_attproj,
                 l_atty,
                 l_attprojw,
-                l_attprojb,
+                Some(l_attprojb),
                 b,
                 t,
                 c,
                 c);
             residual_forward(
-               &mut l_residual2,
+                l_residual2,
                 &residual,
                 l_attproj,
                 b*t*c);
             layernorm_forward(
-                &mut l_ln2,
-                &mut l_ln2_mean,
-                &mut l_ln2_rstd,
+                l_ln2,
+                l_ln2_mean,
+                l_ln2_rstd,
                 l_residual2,
                 l_ln2w,
                 l_ln2b,
@@ -635,34 +664,59 @@ impl GPT2 {
                 t,
                 c);
             matmul_forward(
-                &mut l_fch,
+                l_fch,
                 l_ln2,
                 l_fcw,
-                l_fcb,
+                Some(l_fcb),
                 b,
                 t,
                 4*c,
                 c);
             gelu_forward(
-                &mut l_fch_gelu,
+                l_fch_gelu,
                 l_fch,
                 b*t*4*c);
             matmul_forward(
-                &mut l_fcproj,
+                l_fcproj,
                 l_fch_gelu,
                 l_fcprojw,
-                l_fcprojb,
+                Some(l_fcprojb),
                 b,
                 t,
                 4*c,
                 c);
             residual_forward(
-                &mut l_residual3,
+                l_residual3,
                 l_ln2,
                 l_fcproj,
                 b*t*c);
         }
         // line 758 of c code
+        let last_layer_index = (l - 1) * b * t * c;
+        let residual = &mut self.acts.residual3[last_layer_index..];
+        layernorm_forward(
+            &mut self.acts.lnf,
+            &mut self.acts.lnf_mean,
+            &mut self.acts.lnf_rstd,
+            residual,
+            &self.params.lnfw,
+            &self.params.lnfb,
+            b,
+            t,
+            c);
+        matmul_forward(&mut self.acts.logits,
+            &mut self.acts.lnf,
+            & self.params.wte,
+            None,
+            b,
+            t,
+            c,
+            v);
+        softmax_forward(&mut self.acts.probs,
+            &self.acts.logits,
+            b,
+            t,
+            v);
 
         Ok(())
     }
