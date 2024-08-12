@@ -244,6 +244,16 @@ fn softmax_forward(out: &mut [f32], logits: &[f32], b: usize, t: usize, v: usize
     }
 }
 
+fn crossentropy_forward(out: &mut [f32], probs: &[f32], targets: &[i32], b: usize, t: usize, v: usize){
+    for b_idx in 0..b {
+        for t_idx in 0..t {
+            let target = targets[b_idx * t + t_idx] as usize; // int ix
+            let start_idx = b_idx * t * v + t_idx * v; // index
+            let probs_bt = &probs[start_idx..start_idx + v]; //  probs_bt
+            out[b_idx * t + t_idx] = -probs_bt[target].ln();
+        }
+    }
+}
 
 //******** DATALOADER CONFIGURATIONS ******//
 struct DataLoader {
@@ -523,9 +533,11 @@ impl GPT2 {
         self.acts.logits.resize(b * t * v, 0.0);
         self.acts.probs.resize(b * t * v, 0.0);
         self.acts.losses.resize(b * t, 0.0);
+
+
     }
     /* FORWARD PASS */
-    pub fn forward(&mut self, inputs: &[i32], targets: &[i32], b: usize, t: usize) -> io::Result<(), String> {
+    pub fn forward(&mut self, inputs: &[i32], targets: Option<&[i32]>, b: usize, t: usize) -> io::Result<(), String> {
         // Ensure the model is properly initialized
         if self.params_memory.is_empty() {
             return Err(io::Error::new(io::ErrorKind::Other, "Error: model was not initialized properly."));
@@ -551,9 +563,10 @@ impl GPT2 {
 
         // Cache the inputs and optionally the targets
         self.inputs = inputs.to_vec();
-        // if let Some(tgts) = targets {
-        //     self.targets = Some(tgts.to_vec());
-        // }
+
+        if let Some(targets) = targets {
+            self.targets = targets.to_vec();
+        }
 
         // Call encoder_forward
         //let out = vec![0.0; b * t * c]; // Output tensor for the encoder
@@ -717,7 +730,17 @@ impl GPT2 {
             b,
             t,
             v);
-
+        // line 764
+        if let Some(targets) = targets {
+            crossentropy_forward(&mut self.acts.losses, &self.acts.probs, targets, b, t, v);
+            let mut loss = 0.0;
+            for i in 0..b*t {
+                loss += self.acts.losses[i];
+            }
+            self.mean_loss = loss / (b * t) as f32;
+        }else{
+            self.mean_loss = -1.0;
+        }
         Ok(())
     }
 
@@ -841,19 +864,37 @@ fn main() {
     let T: usize = 64;
     let val_num_batches = 10;
     // train loader
-    let train_loader: DataLoader = DataLoader::new(tiny_shakespeare_train, B, T).unwrap();
+    let mut train_loader: DataLoader = DataLoader::new(tiny_shakespeare_train, B, T).unwrap();
     // debug print
     println!("Num batches: {}", train_loader.num_batches);
     // val loader
-    let val_loader: DataLoader = DataLoader::new(tiny_shakespeare_val, B, T).unwrap();
+    let mut val_loader: DataLoader = DataLoader::new(tiny_shakespeare_val, B, T).unwrap();
 
-    /* TO BE IMPLEMENTED */
-    // some memory for generating samples from the model
-    // unsigned long long rng_state = 1337;
-    // const int gen_max_length = 64;
-    // int gen_tokens[gen_max_length];
-
-    /* Training step */
-
-
+    // training variables
+    let rng_state = 1337;
+    const GEN_MAX_LENGTH: usize = 64; // move the const above
+    let mut gen_tokens = [0; GEN_MAX_LENGTH];
+    // init of the model
+    model.mean_loss = 0.0;
+    for step in 0..40{
+        // Once in a while estimate the validation loss
+        if step % 10 == 0 {
+            let mut val_loss = 0.0;
+            val_loader.reset();
+            for _ in 0..val_num_batches {
+                val_loader.next_batch();
+                model.forward(&val_loader.inputs, Some(&val_loader.targets), B, T);
+                val_loss += model.mean_loss;
+            }
+            val_loss /= val_num_batches as f32;
+            println!("val loss: {}", val_loss);
+        }
+        // Training step
+        train_loader.reset();
+        for _ in 0..train_loader.num_batches {
+            train_loader.next_batch();
+            model.forward(&train_loader.inputs, Some(&train_loader.targets), B, T);
+            //print!("train loss: {}", model.mean_loss);
+        }
+    }
 }
