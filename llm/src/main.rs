@@ -587,7 +587,9 @@ impl GPT2 {
             let mut residual: Vec<f32> = if l == 0 {
                 self.acts.encoded.clone()
             } else {
-                self.acts.residual3[(index_base - 1)*self.batch_size * self.seq_len * self.config.channels..index_base].to_vec()
+                // review thig part
+                self.acts.residual3[(l - 1)*self.batch_size * self.seq_len * self.config.channels..index_base].to_vec()
+
             };
 
             // Access layer-specific parameters
@@ -611,27 +613,27 @@ impl GPT2 {
             let l_fcprojw = &self.params.fcprojw[l * self.config.channels * 4 * self.config.channels..(l + 1) * self.config.channels * 4 * self.config.channels];
             let l_fcprojb = &self.params.fcprojb[l * self.config.channels..(l + 1) * self.config.channels];
 
-            let base_idx = l * self.batch_size * self.seq_len;
-            let c = self.config.channels;
+            //let base_idx = l * self.batch_size * self.seq_len;
+            //let c = self.config.channels;
             let nh = self.config.num_heads;
 
             // Activation slices for this layer
-            let l_ln1 = &mut self.acts.ln1[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
-            let l_ln1_mean = &mut self.acts.ln1_mean[base_idx..base_idx + self.batch_size * self.seq_len];
-            let l_ln1_rstd = &mut self.acts.ln1_rstd[base_idx..base_idx + self.batch_size * self.seq_len];
-            let l_qkv = &mut self.acts.qkv[base_idx * 3 * c..(base_idx + self.batch_size * self.seq_len) * 3 * c];
-            let l_atty = &mut self.acts.atty[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
-            let l_preatt = &mut self.acts.preatt[base_idx * nh * self.seq_len..(base_idx + self.batch_size * nh * self.seq_len) * self.seq_len];
-            let l_att = &mut self.acts.att[base_idx * nh * self.seq_len..(base_idx + self.batch_size * nh * self.seq_len) * self.seq_len];
-            let l_attproj = &mut self.acts.attproj[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
-            let l_residual2 = &mut self.acts.residual2[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
-            let l_ln2 = &mut self.acts.ln2[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
-            let l_ln2_mean = &mut self.acts.ln2_mean[base_idx..base_idx + self.batch_size * self.seq_len];
-            let l_ln2_rstd = &mut self.acts.ln2_rstd[base_idx..base_idx + self.batch_size * self.seq_len];
-            let l_fch = &mut self.acts.fch[base_idx * 4 * c..(base_idx + self.batch_size * self.seq_len) * 4 * c];
-            let l_fch_gelu = &mut self.acts.fch_gelu[base_idx * 4 * c..(base_idx + self.batch_size * self.seq_len) * 4 * c];
-            let l_fcproj = &mut self.acts.fcproj[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
-            let l_residual3 = &mut self.acts.residual3[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
+            let l_ln1 = &mut self.acts.ln1[index_base..next_index_base];
+            let l_ln1_mean = &mut self.acts.ln1_mean[l*self.batch_size*self.seq_len..(l+1)*self.batch_size*self.seq_len];
+            let l_ln1_rstd = &mut self.acts.ln1_rstd[l*self.batch_size*self.seq_len..(l+1)*self.batch_size*self.seq_len];
+            let l_qkv = &mut self.acts.qkv[index_base*3..next_index_base*3];
+            let l_atty = &mut self.acts.atty[index_base..next_index_base];
+            let l_preatt = &mut self.acts.preatt[l*self.batch_size*nh*self.seq_len*self.seq_len..(l+1)*self.batch_size*nh*self.seq_len*self.seq_len];
+            let l_att = &mut self.acts.att[l*self.batch_size*nh*self.seq_len*self.seq_len..(l+1)*self.batch_size*nh*self.seq_len*self.seq_len];
+            let l_attproj = &mut self.acts.attproj[index_base..next_index_base];
+            let l_residual2 = &mut self.acts.residual2[index_base..next_index_base];
+            let l_ln2 = &mut self.acts.ln2[index_base..next_index_base];
+            let l_ln2_mean = &mut self.acts.ln2_mean[l*self.batch_size*self.seq_len..(l+1)*self.batch_size*self.seq_len];
+            let l_ln2_rstd = &mut self.acts.ln2_rstd[l*self.batch_size*self.seq_len..(l+1)*self.batch_size*self.seq_len];
+            let l_fch = &mut self.acts.fch[index_base*4..next_index_base*4];
+            let l_fch_gelu = &mut self.acts.fch_gelu[index_base*4..next_index_base*4];
+            let l_fcproj = &mut self.acts.fcproj[index_base..next_index_base];
+            let l_residual3 = &mut self.acts.residual3[index_base..next_index_base];
 
             // FORWARD PASS
             println!("Executing layernorm foward pass");
@@ -726,7 +728,7 @@ impl GPT2 {
                 l_fcproj,
                 b*t*c);
         }
-        // line 758 of c code
+        // line 758 of c code FURTHER CHECKS NEEDED HERE
         let last_layer_index = (l - 1) * b * t * c;
         let residual = &mut self.acts.residual3[last_layer_index..];
         layernorm_forward(
