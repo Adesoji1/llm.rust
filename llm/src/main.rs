@@ -9,20 +9,17 @@ const NUM_ACTIVATION_TENSORS: usize = 23;
 
 //***** UTILITY FUNCTION **** */
 fn encoder_forward(out: &mut [f32], inp: &[i32], wte: &[f32], wpe: &[f32], b: usize, t: usize, c: usize) {
+    println!("b: {}, t: {}, c: {}", b, t, c);
     for b_idx in 0..b {
         for t_idx in 0..t {
             let out_start_idx = b_idx * t * c + t_idx * c;
             let out_bt = &mut out[out_start_idx..out_start_idx + c];
-
             // Get the index of the token at inp[b, t]
             let ix = inp[b_idx * t + t_idx] as usize;  // Convert to usize for safe indexing
-
             let wte_start_idx = ix * c;
             let wte_ix = &wte[wte_start_idx..wte_start_idx + c];
-
             let wpe_start_idx = t_idx * c;
             let wpe_t = &wpe[wpe_start_idx..wpe_start_idx + c];
-
             // Add the two vectors and store the result in out[b, t, :]
             for i in 0..c {
                 out_bt[i] = wte_ix[i] + wpe_t[i];
@@ -94,24 +91,27 @@ fn matmul_forward(
     // input is (B, T, C), weight is (OC, C), bias is (OC)
     // output will be (B, T, OC)
 
-    for b_idx in 0..b {
-        for t_idx in 0..t {
-            let out_start_idx = b_idx * t * oc + t_idx * oc;
-            let inp_start_idx = b_idx * t * c + t_idx * c;
 
-            for o in 0..oc {
-                let wrow_start_idx = o * c;
-                // bias
-                let default_bias = 0.0;
-                let bias_value = bias.map_or(default_bias, |b| *b.get(o).unwrap_or(&default_bias)); // double check this
-                let mut sum = bias_value;
-                for i in 0..c {
-                    sum += inp[inp_start_idx + i] * weight[wrow_start_idx + i];
-                }
-                out[out_start_idx + o] = sum;
+    for (b_idx, chunk) in inp.chunks(t * c).enumerate().take(b) {
+        for (t_idx, inp_bt) in chunk.chunks(c).enumerate().take(t) {
+            let out_bt = &mut out[b_idx * t * oc + t_idx * oc..][..oc];
+            for (o, output) in out_bt.iter_mut().enumerate().take(oc) {
+                let bias_val = bias.map_or(0.0, |b| b[o]);
+                let weight_row = &weight[o * c..][..c];
+                let val = inp_bt
+                    .iter()
+                    .zip(weight_row.iter())
+                    .fold(bias_val, |acc, (&inp_val, &weight_val)| acc + inp_val * weight_val);
+                *output = val;
             }
         }
     }
+    /* Medium test:
+    use rayon::prelude::*;
+
+    inp.par_chunks(t * c).enumerate().take(b).for_each(|(b_idx, chunk)| {
+        // Similar inner loops as above
+    }); */
 }
 
 
@@ -128,7 +128,10 @@ fn attention_forward(
     let c3 = c * 3;
     let hs = c / nh; // head size
     let scale = 1.0 / (hs as f32).sqrt();
-
+    println!("b: {}, t: {}, c: {}", b, t, c);
+    println!("Size of preatt {}", preatt.len());
+    println!("Size of att {}", att.len());
+    println!("Size of inp {}", inp.len());
     for b_idx in 0..b {
         for t_idx in 0..t {
             for h in 0..nh {
@@ -537,7 +540,7 @@ impl GPT2 {
 
     }
     /* FORWARD PASS */
-    pub fn forward(&mut self, inputs: &[i32], targets: Option<&[i32]>, b: usize, t: usize) -> io::Result<(), String> {
+    pub fn forward(&mut self, inputs: &[i32], targets: Option<&[i32]>, b: usize, t: usize) -> io::Result<()> {
         // Ensure the model is properly initialized
         if self.params_memory.is_empty() {
             return Err(io::Error::new(io::ErrorKind::Other, "Error: model was not initialized properly."));
@@ -547,7 +550,6 @@ impl GPT2 {
         let l = self.config.num_layers;
         let nh = self.config.num_heads;
         let c = self.config.channels;
-
         // allocate space for all the activations if needed
         if self.acts_memory.is_empty() {
             self.batch_size = b;
@@ -563,6 +565,7 @@ impl GPT2 {
 
         // Cache the inputs and optionally the targets
         self.inputs = inputs.to_vec();
+        println!("inputs size: {}", self.inputs.len());
 
         if let Some(targets) = targets {
             self.targets = targets.to_vec();
@@ -572,20 +575,29 @@ impl GPT2 {
         //let out = vec![0.0; b * t * c]; // Output tensor for the encoder
         let wte = &self.params.wte;
         let wpe = &self.params.wpe;
-
+        // print size of wte and wpe
         encoder_forward(&mut self.acts.encoded, &inputs, &wte, &wpe, b, t, c);
-
         // Process each layer
         for l in 0..self.config.num_layers {
             // Get the residual from the previous layer
-            let index_base = l * self.batch_size * self.seq_len * self.config.channels;
+            let index_base = l * self.batch_size * self.seq_len * self.config.channels; // L*B*T*C
+
+            let next_index_base = (l + 1) * self.batch_size * self.seq_len * self.config.channels; // (L+1)*B*T*C
+
             let mut residual: Vec<f32> = if l == 0 {
                 self.acts.encoded.clone()
             } else {
-                self.acts.residual3[index_base - self.batch_size * self.seq_len * self.config.channels..index_base].to_vec()
+                self.acts.residual3[(index_base - 1)*self.batch_size * self.seq_len * self.config.channels..index_base].to_vec()
             };
 
             // Access layer-specific parameters
+            /* Lesson to write on Medium
+            In C we perform the pointer arithmetic
+            performs pointer arithmetic to obtain the address of a segment within the ln1w array. This effectively moves the pointer l * C positions forward from the start of the array, which corresponds to the start of the weight matrix for the l-th layer.
+
+            In Rust, direct pointer manipulation like this is generally avoided to maintain safety. Instead, Rust uses slices, which are safer because they maintain bounds-checking and other safety properties. When you write:
+
+            */
             let l_ln1w = &self.params.ln1w[l * self.config.channels..(l + 1) * self.config.channels];
             let l_ln1b = &self.params.ln1b[l * self.config.channels..(l + 1) * self.config.channels];
             let l_qkvw = &self.params.qkvw[l * 3 * self.config.channels * self.config.channels..(l + 1) * 3 * self.config.channels * self.config.channels];
@@ -622,6 +634,7 @@ impl GPT2 {
             let l_residual3 = &mut self.acts.residual3[base_idx * c..(base_idx + self.batch_size * self.seq_len) * c];
 
             // FORWARD PASS
+            println!("Executing layernorm foward pass");
             layernorm_forward(
                  l_ln1,
                  l_ln1_mean,
@@ -633,6 +646,7 @@ impl GPT2 {
                 self.seq_len,
                 self.config.channels
             );
+            println!("Executing matmul forward pass");
             matmul_forward(
                 l_qkv,
                 l_ln1,      // Input
@@ -643,6 +657,7 @@ impl GPT2 {
                 c,
                 3*c
             );
+            println!("Executing attention forward pass");
             attention_forward(
                 l_atty,
                 l_preatt,
@@ -652,6 +667,7 @@ impl GPT2 {
                 t,
                 c,
                 nh);
+            println!("Executing matmul forward pass");
             matmul_forward(
                 l_attproj,
                 l_atty,
@@ -661,11 +677,13 @@ impl GPT2 {
                 t,
                 c,
                 c);
+            println!("Executing residual forward pass");
             residual_forward(
                 l_residual2,
                 &residual,
                 l_attproj,
                 b*t*c);
+            println!("Executing layernorm forward pass");
             layernorm_forward(
                 l_ln2,
                 l_ln2_mean,
@@ -676,6 +694,7 @@ impl GPT2 {
                 b,
                 t,
                 c);
+            println!("Executing matmul forward pass");
             matmul_forward(
                 l_fch,
                 l_ln2,
@@ -685,10 +704,12 @@ impl GPT2 {
                 t,
                 4*c,
                 c);
+            println!("Executing gelu forward pass");
             gelu_forward(
                 l_fch_gelu,
                 l_fch,
                 b*t*4*c);
+            println!("Executing matmul forward pass");
             matmul_forward(
                 l_fcproj,
                 l_fch_gelu,
@@ -698,6 +719,7 @@ impl GPT2 {
                 t,
                 4*c,
                 c);
+            println!("Executing residual forward pass");
             residual_forward(
                 l_residual3,
                 l_ln2,
@@ -803,14 +825,35 @@ fn gpt2_build_from_checkpoint(model: &mut GPT2, checkpoint_path: &Path) -> io::R
     ];
 
     let num_parameters: usize = model.param_sizes.iter().sum();
+    println!{"Number of parameters: {}", num_parameters};
     model.num_parameters = num_parameters;
 
     // Allocate space for all parameters and read them in
     model.params_memory = vec![0.0; num_parameters];
+    println!("params_memory size: {}", model.params_memory.len());
     for i in 0..num_parameters {
         model.params_memory[i] = file.read_f32::<LittleEndian>()?;
     }
     // littleendian: functionality for reading and writing numbers in either little-endian or big-endian byte order directly to and from byte arrays
+
+    // read all teh input model params ugly implementation
+    let mut offset = 0;
+    model.params.wte = model.params_memory[offset..offset + model.param_sizes[0]].to_vec(); offset += model.param_sizes[0];
+    model.params.wpe = model.params_memory[offset..offset + model.param_sizes[1]].to_vec(); offset += model.param_sizes[1];
+    model.params.ln1w = model.params_memory[offset..offset + model.param_sizes[2]].to_vec(); offset += model.param_sizes[2];
+    model.params.ln1b = model.params_memory[offset..offset + model.param_sizes[3]].to_vec(); offset += model.param_sizes[3];
+    model.params.qkvw = model.params_memory[offset..offset + model.param_sizes[4]].to_vec(); offset += model.param_sizes[4];
+    model.params.qkvb = model.params_memory[offset..offset + model.param_sizes[5]].to_vec(); offset += model.param_sizes[5];
+    model.params.attprojw = model.params_memory[offset..offset + model.param_sizes[6]].to_vec(); offset += model.param_sizes[6];
+    model.params.attprojb = model.params_memory[offset..offset + model.param_sizes[7]].to_vec(); offset += model.param_sizes[7];
+    model.params.ln2w = model.params_memory[offset..offset + model.param_sizes[8]].to_vec(); offset += model.param_sizes[8];
+    model.params.ln2b = model.params_memory[offset..offset + model.param_sizes[9]].to_vec(); offset += model.param_sizes[9];
+    model.params.fcw = model.params_memory[offset..offset + model.param_sizes[10]].to_vec(); offset += model.param_sizes[10];
+    model.params.fcb = model.params_memory[offset..offset + model.param_sizes[11]].to_vec(); offset += model.param_sizes[11];
+    model.params.fcprojw = model.params_memory[offset..offset + model.param_sizes[12]].to_vec(); offset += model.param_sizes[12];
+    model.params.fcprojb = model.params_memory[offset..offset + model.param_sizes[13]].to_vec(); offset += model.param_sizes[13];
+    model.params.lnfw = model.params_memory[offset..offset + model.param_sizes[14]].to_vec(); offset += model.param_sizes[14];
+    model.params.lnfb = model.params_memory[offset..offset + model.param_sizes[15]].to_vec(); offset += model.param_sizes[15];
 
     // Initialize other fields to defaults
     model.acts_memory = Vec::new();
@@ -852,8 +895,9 @@ fn print_model_summary(model: &GPT2) {
 fn main() {
 
     let mut model = GPT2::new();
-    let checkpoint_path = Path::new("/Users/stefano.bosisio/Documents/llm.rust//gpt2_124M.bin");
+    let checkpoint_path = Path::new("/Users/stefano.bosisio/Documents/llm.rust/gpt2_124M.bin");
     let _ = gpt2_build_from_checkpoint(&mut model,  &checkpoint_path);
+    print_model_summary(&model);
 
     // debugging
     //print_model_summary(&model);
@@ -871,9 +915,9 @@ fn main() {
     let mut val_loader: DataLoader = DataLoader::new(tiny_shakespeare_val, B, T).unwrap();
 
     // training variables
-    let rng_state = 1337;
+    //let rng_state = 1337;
     const GEN_MAX_LENGTH: usize = 64; // move the const above
-    let mut gen_tokens = [0; GEN_MAX_LENGTH];
+    //let mut gen_tokens = [0; GEN_MAX_LENGTH];
     // init of the model
     model.mean_loss = 0.0;
     for step in 0..40{
