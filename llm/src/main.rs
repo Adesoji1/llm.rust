@@ -2,6 +2,14 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::fs::File;
 use std::path::Path;
 use byteorder::{ReadBytesExt, LittleEndian};
+use rayon::prelude::*;
+use std::sync::Mutex;
+/*Exaplanation for mutex
+ rayon expects the data being mutated to be isolated per iteration to avoid data races. Since out is a mutable reference that multiple threads attempt to access simultaneously, Rust prevents this to ensure safety.
+
+ use rayon's Mutex or Atomic types to handle concurrent writes to shared data. Here, using Mutex around the out array is appropriate since we're writing to different parts of the array concurrently. Each thread will lock the Mutex to write its results.
+
+Here's how you can modify the code using rayon and Mutex */
 
 const NUM_PARAMETER_TENSORS: usize = 16;
 const NUM_ACTIVATION_TENSORS: usize = 23;
@@ -85,16 +93,45 @@ fn matmul_forward(
     t: usize,
     c: usize,
     oc: usize,
-) {
+)
     // Main multiplication function
     // OC is output channels
     // input is (B, T, C), weight is (OC, C), bias is (OC)
     // output will be (B, T, OC)
 
+    // {
+    // for (b_idx, chunk) in inp.chunks(t * c).enumerate().take(b) {
+    //     for (t_idx, inp_bt) in chunk.chunks(c).enumerate().take(t) {
+    //         let out_bt = &mut out[b_idx * t * oc + t_idx * oc..][..oc];
+    //         for (o, output) in out_bt.iter_mut().enumerate().take(oc) {
+    //             let bias_val = bias.map_or(0.0, |b| b[o]);
+    //             let weight_row = &weight[o * c..][..c];
+    //             let val = inp_bt
+    //                 .iter()
+    //                 .zip(weight_row.iter())
+    //                 .fold(bias_val, |acc, (&inp_val, &weight_val)| acc + inp_val * weight_val);
+    //             *output = val;
+    //         }
+    //     }
+    // }
+    // }
+{
+    // Ensure the input slice has the expected size
+    //assert_eq!(inp.len(), b * t * c, "Input size is incorrect");
 
-    for (b_idx, chunk) in inp.chunks(t * c).enumerate().take(b) {
-        for (t_idx, inp_bt) in chunk.chunks(c).enumerate().take(t) {
-            let out_bt = &mut out[b_idx * t * oc + t_idx * oc..][..oc];
+    let out = Mutex::new(out); // Wrap `out` in a Mutex to allow safe concurrent writes
+
+    (0..b).into_par_iter().for_each(|b_idx| {
+        let start_idx = b_idx * t * c;
+        let end_idx = (b_idx + 1) * t * c;
+
+        // Ensure the indices are within bounds
+        if start_idx >= inp.len() || end_idx > inp.len() {
+            return; // Skip this iteration if indices are out of bounds
+        }
+
+        for (t_idx, inp_bt) in inp[start_idx..end_idx].chunks(c).enumerate() {
+            let mut out_bt = vec![0.0; oc]; // Temporary buffer for the current (B, T) output
             for (o, output) in out_bt.iter_mut().enumerate().take(oc) {
                 let bias_val = bias.map_or(0.0, |b| b[o]);
                 let weight_row = &weight[o * c..][..c];
@@ -104,16 +141,13 @@ fn matmul_forward(
                     .fold(bias_val, |acc, (&inp_val, &weight_val)| acc + inp_val * weight_val);
                 *output = val;
             }
+            // Write back to the main output
+            let mut out_lock = out.lock().unwrap(); // Lock the Mutex to get mutable access
+            out_lock[b_idx * t * oc + t_idx * oc..b_idx * t * oc + (t_idx + 1) * oc]
+                .copy_from_slice(&out_bt);
         }
-    }
-    /* Medium test:
-    use rayon::prelude::*;
-
-    inp.par_chunks(t * c).enumerate().take(b).for_each(|(b_idx, chunk)| {
-        // Similar inner loops as above
-    }); */
+    });
 }
-
 
 fn attention_forward(
     out: &mut [f32],
@@ -128,10 +162,6 @@ fn attention_forward(
     let c3 = c * 3;
     let hs = c / nh; // head size
     let scale = 1.0 / (hs as f32).sqrt();
-    println!("b: {}, t: {}, c: {}", b, t, c);
-    println!("Size of preatt {}", preatt.len());
-    println!("Size of att {}", att.len());
-    println!("Size of inp {}", inp.len());
     for b_idx in 0..b {
         for t_idx in 0..t {
             for h in 0..nh {
@@ -565,7 +595,7 @@ impl GPT2 {
 
         // Cache the inputs and optionally the targets
         self.inputs = inputs.to_vec();
-        println!("inputs size: {}", self.inputs.len());
+        //println!("inputs size: {}", self.inputs.len());
 
         if let Some(targets) = targets {
             self.targets = targets.to_vec();
@@ -636,7 +666,7 @@ impl GPT2 {
             let l_residual3 = &mut self.acts.residual3[index_base..next_index_base];
 
             // FORWARD PASS
-            println!("Executing layernorm foward pass");
+            //println!("Executing layernorm foward pass");
             layernorm_forward(
                  l_ln1,
                  l_ln1_mean,
@@ -648,7 +678,7 @@ impl GPT2 {
                 self.seq_len,
                 self.config.channels
             );
-            println!("Executing matmul forward pass");
+            //println!("Executing matmul forward pass");
             matmul_forward(
                 l_qkv,
                 l_ln1,      // Input
@@ -659,7 +689,7 @@ impl GPT2 {
                 c,
                 3*c
             );
-            println!("Executing attention forward pass");
+            //println!("Executing attention forward pass");
             attention_forward(
                 l_atty,
                 l_preatt,
@@ -669,7 +699,7 @@ impl GPT2 {
                 t,
                 c,
                 nh);
-            println!("Executing matmul forward pass");
+            //println!("Executing matmul forward pass");
             matmul_forward(
                 l_attproj,
                 l_atty,
@@ -679,13 +709,13 @@ impl GPT2 {
                 t,
                 c,
                 c);
-            println!("Executing residual forward pass");
+            //println!("Executing residual forward pass");
             residual_forward(
                 l_residual2,
                 &residual,
                 l_attproj,
                 b*t*c);
-            println!("Executing layernorm forward pass");
+            //println!("Executing layernorm forward pass");
             layernorm_forward(
                 l_ln2,
                 l_ln2_mean,
@@ -696,7 +726,7 @@ impl GPT2 {
                 b,
                 t,
                 c);
-            println!("Executing matmul forward pass");
+            //println!("Executing matmul forward pass");
             matmul_forward(
                 l_fch,
                 l_ln2,
@@ -706,12 +736,12 @@ impl GPT2 {
                 t,
                 4*c,
                 c);
-            println!("Executing gelu forward pass");
+            //println!("Executing gelu forward pass");
             gelu_forward(
                 l_fch_gelu,
                 l_fch,
                 b*t*4*c);
-            println!("Executing matmul forward pass");
+            //println!("Executing matmul forward pass");
             matmul_forward(
                 l_fcproj,
                 l_fch_gelu,
@@ -721,16 +751,15 @@ impl GPT2 {
                 t,
                 4*c,
                 c);
-            println!("Executing residual forward pass");
+            //println!("Executing residual forward pass");
             residual_forward(
                 l_residual3,
                 l_ln2,
                 l_fcproj,
                 b*t*c);
         }
-        // line 758 of c code FURTHER CHECKS NEEDED HERE
-        let last_layer_index = (l - 1) * b * t * c;
-        let residual = &mut self.acts.residual3[last_layer_index..];
+        // line 758 of C code
+        let residual = &mut self.acts.residual3[(self.config.num_layers - 1)*self.batch_size * self.seq_len * self.config.channels..].to_vec();
         layernorm_forward(
             &mut self.acts.lnf,
             &mut self.acts.lnf_mean,
@@ -922,8 +951,9 @@ fn main() {
     //let mut gen_tokens = [0; GEN_MAX_LENGTH];
     // init of the model
     model.mean_loss = 0.0;
-    for step in 0..40{
+    for step in 0..20{
         // Once in a while estimate the validation loss
+        println!("Step: {}", step);
         if step % 10 == 0 {
             let mut val_loss = 0.0;
             val_loader.reset();

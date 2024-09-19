@@ -6,3 +6,13 @@ edition = "2021"
 [dependencies]
 byteorder = "1.4"
 bytemuck = "1.16.0"
+rayon = "1.10.0"
+
+
+[profile.release]
+lto = true
+codegen-units = 1
+incremental = false
+overflow-checks = false
+debug-assertions = false
+opt-level = 3
