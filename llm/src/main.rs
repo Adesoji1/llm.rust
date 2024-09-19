@@ -3,7 +3,7 @@ use std::fs::File;
 use std::path::Path;
 use byteorder::{ReadBytesExt, LittleEndian};
 use rayon::prelude::*;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 /*Exaplanation for mutex
  rayon expects the data being mutated to be isolated per iteration to avoid data races. Since out is a mutable reference that multiple threads attempt to access simultaneously, Rust prevents this to ensure safety.
 
@@ -149,6 +149,72 @@ fn matmul_forward(
     });
 }
 
+
+fn matmul_backward(
+    dinp: &mut [f32],
+    dweight: &mut [f32],
+    dbias: Option<&mut [f32]>,
+    dout: &[f32],
+    inp: &[f32],
+    weight: &[f32],
+    b: usize,
+    t: usize,
+    c: usize,
+    oc: usize,
+) {
+    // Parallel over B and T for backward into `dinp`
+    let dinp = Arc::new(Mutex::new(dinp)); // Wrap `dinp` in a Mutex and Arc for safe concurrent writes
+    (0..b).into_par_iter().for_each(|b_idx| {
+        let base_idx_inp = b_idx * t * c;
+        let base_idx_out = b_idx * t * oc;
+
+        (0..t).into_par_iter().for_each(|t_idx| {
+            let dout_bt = &dout[base_idx_out + t_idx * oc..][..oc];
+            let dinp_bt = &mut dinp.lock().unwrap()[base_idx_inp + t_idx * c..][..c];
+
+            for o in 0..oc {
+                let d = dout_bt[o];
+                let wrow = &weight[o * c..][..c];
+                for i in 0..c {
+                    dinp_bt[i] += wrow[i] * d;
+                }
+            }
+        });
+    });
+
+    // Parallel over OC for backward into `dweight` and `dbias`
+    let dweight = Arc::new(Mutex::new(dweight));
+    let dbias = dbias.map(|db| Arc::new(Mutex::new(db))); // Wrap `dbias` similarly if it's Some
+
+    (0..oc).into_par_iter().for_each(|o| {
+        let mut dwrow = vec![0.0; c];
+        let mut dbias_accum = 0.0;
+
+        for b_idx in 0..b {
+            for t_idx in 0..t {
+                let dout_bt = &dout[b_idx * t * oc + t_idx * oc..][..oc];
+                let inp_bt = &inp[b_idx * t * c + t_idx * c..][..c];
+                let d = dout_bt[o];
+
+                for i in 0..c {
+                    dwrow[i] += inp_bt[i] * d;
+                }
+                dbias_accum += d;
+            }
+        }
+
+        let mut dweight_lock = dweight.lock().unwrap();
+        let dw_slice = &mut dweight_lock[o * c..(o + 1) * c];
+        dw_slice.copy_from_slice(&dwrow);
+
+        if let Some(ref dbias) = dbias {
+            let mut dbias_lock = dbias.lock().unwrap();
+            dbias_lock[o] += dbias_accum;
+        }
+    });
+}
+
+
 fn attention_forward(
     out: &mut [f32],
     preatt: &mut [f32],
@@ -284,6 +350,32 @@ fn crossentropy_forward(out: &mut [f32], probs: &[f32], targets: &[i32], b: usiz
             let start_idx = b_idx * t * v + t_idx * v; // index
             let probs_bt = &probs[start_idx..start_idx + v]; //  probs_bt
             out[b_idx * t + t_idx] = -probs_bt[target].ln();
+        }
+    }
+}
+
+fn crossentropy_softmax_backward(
+    dlogits: &mut [f32],
+    dlosses: &mut [f32],
+    probs: &[f32],
+    targets: &[i32],
+    b: usize,
+    t: usize,
+    v: usize,
+) {
+    for b_idx in 0..b {
+        for t_idx in 0..t {
+            let idx_start = b_idx * t * v + t_idx * v;
+            let dlogits_bt = &mut dlogits[idx_start..idx_start + v];
+            let probs_bt = &probs[idx_start..idx_start + v];
+            let dloss = dlosses[b_idx * t + t_idx];
+            let target_idx = targets[b_idx * t + t_idx] as usize;  // Convert to usize for indexing
+
+            for i in 0..v {
+                let p = probs_bt[i];
+                let indicator = (i == target_idx) as i32 as f32;  // 1.0 if true, 0.0 otherwise
+                dlogits_bt[i] += (p - indicator) * dloss;
+            }
         }
     }
 }
@@ -796,6 +888,53 @@ impl GPT2 {
         }
         Ok(())
     }
+    pub fn zero_grad(&mut self) {
+        // Using the fill method to set all elements to zero
+        self.grads_memory.fill(0.0);
+        self.grads_acts_memory.fill(0.0);
+
+        // Alternatively, using an iterator method (commented out since fill is preferable):
+        // self.grads_memory.iter_mut().for_each(|g| *g = 0.0);
+        // self.grads_acts_memory.iter_mut().for_each(|g| *g = 0.0);
+        /* Medium explanation
+        To implement the gpt2_zero_grad function in Rust, you will want to reset all gradients to zero.
+        This is analogous to setting all elements in an array to zero in C, which is often done using memset. In Rust, you don't typically manipulate memory directly like this, but you would instead use Rust's iterator methods or direct indexing.
+
+        Given your structure where you have grads_memory and grads_acts_memory as vectors of f32, you can iterate over these vectors and set each element to zero. Alternatively, you can use the fill method, which is more succinct and expressive.
+
+        fill Method: The fill method sets all items in the slice to the specified value.
+        Iterator Method: It's useful when you need to perform more complex operations during the reset process than just setting a value.
+ */
+    }
+    /* BACKWARD */
+    pub fn backward(& mut self) -> io::Result<()> {
+
+        if self.mean_loss == -1.0 {
+            return Err(io::Error::new(io::ErrorKind::Other, "Error: must forward with targets before backward"));
+        }
+
+        if self.grads_memory.is_empty() {
+            self.grads_memory.resize(self.num_parameters, 0.0);
+            self.grads_acts_memory.resize(self.num_activations, 0.0);
+            self.zero_grad();
+        }
+
+        let b = self.batch_size;
+        let t = self.seq_len;
+        let v = self.config.vocab_size;
+        let l = self.config.num_layers;
+        let c = self.config.channels;
+        let nh = self.config.num_heads;
+        let dloss_mean = 1.0/(b*t) as f32;
+        self.grads_acts.losses.fill(dloss_mean);
+
+        crossentropy_softmax_backward(&mut self.grads_acts.logits, &mut self.grads_acts.losses, &self.acts.probs, &self.targets, b,t,v);
+
+        matmul_backward(&mut self.grads_acts.lnf, &mut self.grads.wte, None, &mut self.grads_acts.logits, &self.acts.lnf, &self.params.wte, b, t, c, v);
+
+        //line816
+
+    }
 
 }
 /* END OF GPT2 CONFIGURATION */
@@ -965,12 +1104,17 @@ fn main() {
             val_loss /= val_num_batches as f32;
             println!("val loss: {}", val_loss);
         }
+        // TODO CREATE THE INFERENCE PART
         // Training step
         train_loader.reset();
         for _ in 0..train_loader.num_batches {
             train_loader.next_batch();
+            model.zero_grad();
             model.forward(&train_loader.inputs, Some(&train_loader.targets), B, T);
             //print!("train loss: {}", model.mean_loss);
+            // TODO gpt2_zero_grad
+            // TODO gpt2_backward
+            // TODO gpt2_update
         }
     }
 }
