@@ -7,11 +7,9 @@ edition = "2021"
 byteorder = "1.4"
 bytemuck = "1.16.0"
 time = "0.3.36"
-rayon = "1.10"
-matrixmultiply = "0.3.9"
+rayon = "1.5"
 ndarray = { version = "0.16.1", features = ["rayon"] }
 blas-src = { version = "0.10.0", features = ["accelerate"] }
-blas = "0.22.0"
 cblas = "0.4.0"
 
 [profile.release]

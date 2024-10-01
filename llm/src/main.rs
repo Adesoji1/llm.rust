@@ -6,8 +6,8 @@ use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use cblas::{sgemm, Layout, Transpose};
 use rayon::prelude::*;
-use matrixmultiply::sgemm;
 /*Exaplanation for mutex
  rayon expects the data being mutated to be isolated per iteration to avoid data races. Since out is a mutable reference that multiple threads attempt to access simultaneously, Rust prevents this to ensure safety.
 
@@ -94,37 +94,43 @@ fn matmul_forward(
     inp: &[f32],
     weight: &[f32],
     bias: Option<&[f32]>,
-    b: usize,
-    t: usize,
-    c: usize,
-    oc: usize,
+    b: usize,   // Batch size
+    t: usize,   // Time steps or sequence length
+    c: usize,   // Input channels
+    oc: usize,  // Output channels
 ) {
-    let m = b * t;
-    let k = c;
-    let n = oc;
+    let m = (b * t) as i32; // Number of rows of the output matrix
+    let k = c as i32;       // Number of columns of the input matrix / rows of the weight matrix
+    let n = oc as i32;      // Number of columns of the output matrix
 
+    // Leading dimensions for Row-Major layout
+    let lda = k; // lda >= K
+    let ldb = n; // ldb >= N
+    let ldc = n; // ldc >= N
+
+    // Perform the matrix multiplication using BLAS sgemm
     unsafe {
         sgemm(
-            m, // m
-            k, // k
-            n, // n
-            1.0, // alpha
-            inp.as_ptr(), // a
-            k as isize, // rsa (row stride of A)
-            1, // csa (column stride of A)
-            weight.as_ptr(), // b
-            n as isize, // rsb (row stride of B)
-            1, // csb (column stride of B)
-            0.0, // beta
-            out.as_mut_ptr(), // c
-            n as isize, // rsc (row stride of C)
-            1, // csc (column stride of C)
+            Layout::RowMajor,
+            Transpose::None, // Transpose of A ('N' for no transpose)
+            Transpose::None, // Transpose of B
+            m,
+            n,
+            k,
+            1.0,
+            inp,
+            lda,
+            weight,
+            ldb,
+            0.0,
+            out,
+            ldc,
         );
     }
 
     // Add bias if present
     if let Some(bias) = bias {
-        out.par_chunks_mut(n)
+        out.par_chunks_mut(oc)
             .for_each(|row| {
                 for (o, val) in row.iter_mut().enumerate() {
                     *val += bias[o];
@@ -132,6 +138,7 @@ fn matmul_forward(
             });
     }
 }
+
 
 
 fn not_optimized_matmul_forward(
