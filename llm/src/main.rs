@@ -4,6 +4,10 @@ use std::path::Path;
 use byteorder::{ReadBytesExt, LittleEndian};
 use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use rayon::prelude::*;
+use matrixmultiply::sgemm;
 /*Exaplanation for mutex
  rayon expects the data being mutated to be isolated per iteration to avoid data races. Since out is a mutable reference that multiple threads attempt to access simultaneously, Rust prevents this to ensure safety.
 
@@ -84,7 +88,53 @@ fn layernorm_forward(
 }
 
 
+
 fn matmul_forward(
+    out: &mut [f32],
+    inp: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    b: usize,
+    t: usize,
+    c: usize,
+    oc: usize,
+) {
+    let m = b * t;
+    let k = c;
+    let n = oc;
+
+    unsafe {
+        sgemm(
+            m, // m
+            k, // k
+            n, // n
+            1.0, // alpha
+            inp.as_ptr(), // a
+            k as isize, // rsa (row stride of A)
+            1, // csa (column stride of A)
+            weight.as_ptr(), // b
+            n as isize, // rsb (row stride of B)
+            1, // csb (column stride of B)
+            0.0, // beta
+            out.as_mut_ptr(), // c
+            n as isize, // rsc (row stride of C)
+            1, // csc (column stride of C)
+        );
+    }
+
+    // Add bias if present
+    if let Some(bias) = bias {
+        out.par_chunks_mut(n)
+            .for_each(|row| {
+                for (o, val) in row.iter_mut().enumerate() {
+                    *val += bias[o];
+                }
+            });
+    }
+}
+
+
+fn not_optimized_matmul_forward(
     out: &mut [f32],
     inp: &[f32],
     weight: &[f32],
@@ -118,7 +168,7 @@ fn matmul_forward(
 {
     // Ensure the input slice has the expected size
     //assert_eq!(inp.len(), b * t * c, "Input size is incorrect");
-
+    println!("b: {}, t: {}, c: {}, oc: {}", b, t, c, oc);
     let out = Mutex::new(out); // Wrap `out` in a Mutex to allow safe concurrent writes
 
     (0..b).into_par_iter().for_each(|b_idx| {
@@ -147,6 +197,7 @@ fn matmul_forward(
                 .copy_from_slice(&out_bt);
         }
     });
+
 }
 
 
@@ -771,6 +822,7 @@ impl GPT2 {
                 self.config.channels
             );
             //println!("Executing matmul forward pass");
+            let start = Instant::now();
             matmul_forward(
                 l_qkv,
                 l_ln1,      // Input
@@ -781,6 +833,8 @@ impl GPT2 {
                 c,
                 3*c
             );
+            let duration = start.elapsed();
+            println!("Function took: {:?}", duration);
             //println!("Executing attention forward pass");
             attention_forward(
                 l_atty,
@@ -792,6 +846,7 @@ impl GPT2 {
                 c,
                 nh);
             //println!("Executing matmul forward pass");
+            let start = Instant::now();
             matmul_forward(
                 l_attproj,
                 l_atty,
@@ -801,6 +856,8 @@ impl GPT2 {
                 t,
                 c,
                 c);
+            let duration = start.elapsed();
+            println!("Function took: {:?}", duration);
             //println!("Executing residual forward pass");
             residual_forward(
                 l_residual2,
@@ -819,6 +876,7 @@ impl GPT2 {
                 t,
                 c);
             //println!("Executing matmul forward pass");
+            let start = Instant::now();
             matmul_forward(
                 l_fch,
                 l_ln2,
@@ -828,12 +886,15 @@ impl GPT2 {
                 t,
                 4*c,
                 c);
+            let duration = start.elapsed();
+            println!("Function took: {:?}", duration);
             //println!("Executing gelu forward pass");
             gelu_forward(
                 l_fch_gelu,
                 l_fch,
                 b*t*4*c);
             //println!("Executing matmul forward pass");
+            let start = Instant::now();
             matmul_forward(
                 l_fcproj,
                 l_fch_gelu,
@@ -843,6 +904,8 @@ impl GPT2 {
                 t,
                 4*c,
                 c);
+            let duration = start.elapsed();
+            println!("Function took: {:?}", duration);
             //println!("Executing residual forward pass");
             residual_forward(
                 l_residual3,
@@ -862,6 +925,7 @@ impl GPT2 {
             b,
             t,
             c);
+        let start = Instant::now();
         matmul_forward(&mut self.acts.logits,
             &mut self.acts.lnf,
             & self.params.wte,
@@ -870,6 +934,8 @@ impl GPT2 {
             t,
             c,
             v);
+        let duration = start.elapsed();
+        println!("Function took: {:?}", duration);
         softmax_forward(&mut self.acts.probs,
             &self.acts.logits,
             b,
@@ -933,7 +999,7 @@ impl GPT2 {
         matmul_backward(&mut self.grads_acts.lnf, &mut self.grads.wte, None, &mut self.grads_acts.logits, &self.acts.lnf, &self.params.wte, b, t, c, v);
 
         //line816
-
+        Ok(())
     }
 
 }
@@ -1063,6 +1129,9 @@ fn print_model_summary(model: &GPT2) {
     // If you have other vectors or arrays, you can add similar print statements here
 }
 fn main() {
+    // Set up Rayon to use a specific number of threads
+    //rayon::ThreadPoolBuilder::new().num_threads(4).build_global().unwrap();
+
 
     let mut model = GPT2::new();
     let checkpoint_path = Path::new("/Users/stefano.bosisio/Documents/llm.rust/gpt2_124M.bin");
@@ -1093,17 +1162,6 @@ fn main() {
     for step in 0..20{
         // Once in a while estimate the validation loss
         println!("Step: {}", step);
-        if step % 10 == 0 {
-            let mut val_loss = 0.0;
-            val_loader.reset();
-            for _ in 0..val_num_batches {
-                val_loader.next_batch();
-                model.forward(&val_loader.inputs, Some(&val_loader.targets), B, T);
-                val_loss += model.mean_loss;
-            }
-            val_loss /= val_num_batches as f32;
-            println!("val loss: {}", val_loss);
-        }
         // TODO CREATE THE INFERENCE PART
         // Training step
         train_loader.reset();
@@ -1115,6 +1173,17 @@ fn main() {
             // TODO gpt2_zero_grad
             // TODO gpt2_backward
             // TODO gpt2_update
+        }
+        if step % 10 == 0 {
+            let mut val_loss = 0.0;
+            val_loader.reset();
+            for _ in 0..val_num_batches {
+                val_loader.next_batch();
+                model.forward(&val_loader.inputs, Some(&val_loader.targets), B, T);
+                val_loss += model.mean_loss;
+            }
+            val_loss /= val_num_batches as f32;
+            println!("val loss: {}", val_loss);
         }
     }
 }
