@@ -829,7 +829,7 @@ impl GPT2 {
                 self.config.channels
             );
             //println!("Executing matmul forward pass");
-            let start = Instant::now();
+            //let start = Instant::now();
             matmul_forward(
                 l_qkv,
                 l_ln1,      // Input
@@ -840,8 +840,8 @@ impl GPT2 {
                 c,
                 3*c
             );
-            let duration = start.elapsed();
-            println!("Function took: {:?}", duration);
+            //let duration = start.elapsed();
+            //println!("Function took: {:?}", duration);
             //println!("Executing attention forward pass");
             attention_forward(
                 l_atty,
@@ -853,7 +853,7 @@ impl GPT2 {
                 c,
                 nh);
             //println!("Executing matmul forward pass");
-            let start = Instant::now();
+            //let start = Instant::now();
             matmul_forward(
                 l_attproj,
                 l_atty,
@@ -863,8 +863,8 @@ impl GPT2 {
                 t,
                 c,
                 c);
-            let duration = start.elapsed();
-            println!("Function took: {:?}", duration);
+            //let duration = start.elapsed();
+            //println!("Function took: {:?}", duration);
             //println!("Executing residual forward pass");
             residual_forward(
                 l_residual2,
@@ -883,7 +883,7 @@ impl GPT2 {
                 t,
                 c);
             //println!("Executing matmul forward pass");
-            let start = Instant::now();
+            //let start = Instant::now();
             matmul_forward(
                 l_fch,
                 l_ln2,
@@ -893,15 +893,15 @@ impl GPT2 {
                 t,
                 4*c,
                 c);
-            let duration = start.elapsed();
-            println!("Function took: {:?}", duration);
+            //let duration = start.elapsed();
+            //println!("Function took: {:?}", duration);
             //println!("Executing gelu forward pass");
             gelu_forward(
                 l_fch_gelu,
                 l_fch,
                 b*t*4*c);
             //println!("Executing matmul forward pass");
-            let start = Instant::now();
+            //let start = Instant::now();
             matmul_forward(
                 l_fcproj,
                 l_fch_gelu,
@@ -911,8 +911,8 @@ impl GPT2 {
                 t,
                 4*c,
                 c);
-            let duration = start.elapsed();
-            println!("Function took: {:?}", duration);
+            //let duration = start.elapsed();
+            //println!("Function took: {:?}", duration);
             //println!("Executing residual forward pass");
             residual_forward(
                 l_residual3,
@@ -932,7 +932,7 @@ impl GPT2 {
             b,
             t,
             c);
-        let start = Instant::now();
+        //let start = Instant::now();
         matmul_forward(&mut self.acts.logits,
             &mut self.acts.lnf,
             & self.params.wte,
@@ -941,8 +941,8 @@ impl GPT2 {
             t,
             c,
             v);
-        let duration = start.elapsed();
-        println!("Function took: {:?}", duration);
+        //let duration = start.elapsed();
+        //println!("Function took: {:?}", duration);
         softmax_forward(&mut self.acts.probs,
             &self.acts.logits,
             b,
