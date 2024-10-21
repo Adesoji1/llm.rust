@@ -21,7 +21,7 @@ const NUM_ACTIVATION_TENSORS: usize = 23;
 
 //***** UTILITY FUNCTION **** */
 fn encoder_forward(out: &mut [f32], inp: &[i32], wte: &[f32], wpe: &[f32], b: usize, t: usize, c: usize) {
-    println!("b: {}, t: {}, c: {}", b, t, c);
+    //println!("b: {}, t: {}, c: {}", b, t, c);
     for b_idx in 0..b {
         for t_idx in 0..t {
             let out_start_idx = b_idx * t * c + t_idx * c;
@@ -717,12 +717,63 @@ impl GPT2 {
         self.acts.probs.resize(b * t * v, 0.0);
         self.acts.losses.resize(b * t, 0.0);
 
-
+        self.num_activations =
+            self.acts.encoded.len()
+            + self.acts.ln1.len()
+            + self.acts.ln1_mean.len()
+            + self.acts.ln1_rstd.len()
+            + self.acts.qkv.len()
+            + self.acts.atty.len()
+            + self.acts.preatt.len()
+            + self.acts.att.len()
+            + self.acts.attproj.len()
+            + self.acts.residual2.len()
+            + self.acts.ln2.len()
+            + self.acts.ln2_mean.len()
+            + self.acts.ln2_rstd.len()
+            + self.acts.fch.len()
+            + self.acts.fch_gelu.len()
+            + self.acts.fcproj.len()
+            + self.acts.residual3.len()
+            + self.acts.lnf.len()
+            + self.acts.lnf_mean.len()
+            + self.acts.lnf_rstd.len()
+            + self.acts.logits.len()
+            + self.acts.probs.len()
+            + self.acts.losses.len();
+    }
+    /* Allocate grad tensors */
+    fn allocate_grad_activation_tensors(&mut self, b: usize, t: usize, l: usize, nh: usize, c: usize, v: usize) {
+        self.grads_acts.encoded.resize(b * t * c, 0.0);
+        self.grads_acts.ln1.resize(l * b * t * c, 0.0);
+        self.grads_acts.ln1_mean.resize(l * b * t, 0.0);
+        self.grads_acts.ln1_rstd.resize(l * b * t, 0.0);
+        self.grads_acts.qkv.resize(l * b * t * 3 * c, 0.0);
+        self.grads_acts.atty.resize(l * b * t * c, 0.0);
+        self.grads_acts.preatt.resize(l * b * nh * t * t, 0.0);
+        self.grads_acts.att.resize(l * b * nh * t * t, 0.0);
+        self.grads_acts.attproj.resize(l * b * t * c, 0.0);
+        self.grads_acts.residual2.resize(l * b * t * c, 0.0);
+        self.grads_acts.ln2.resize(l * b * t * c, 0.0);
+        self.grads_acts.ln2_mean.resize(l * b * t, 0.0);
+        self.grads_acts.ln2_rstd.resize(l * b * t, 0.0);
+        self.grads_acts.fch.resize(l * b * t * 4 * c, 0.0);
+        self.grads_acts.fch_gelu.resize(l * b * t * 4 * c, 0.0);
+        self.grads_acts.fcproj.resize(l * b * t * c, 0.0);
+        self.grads_acts.residual3.resize(l * b * t * c, 0.0);
+        self.grads_acts.lnf.resize(b * t * c, 0.0);
+        self.grads_acts.lnf_mean.resize(b * t, 0.0);
+        self.grads_acts.lnf_rstd.resize(b * t, 0.0);
+        self.grads_acts.logits.resize(b * t * v, 0.0);
+        self.grads_acts.probs.resize(b * t * v, 0.0);
+        self.grads_acts.losses.resize(b * t, 0.0);
     }
     /* FORWARD PASS */
     pub fn forward(&mut self, inputs: &[i32], targets: Option<&[i32]>, b: usize, t: usize) -> io::Result<()> {
         // Ensure the model is properly initialized
         if self.params_memory.is_empty() {
+            self.batch_size = b;
+            self.seq_len = t;
             return Err(io::Error::new(io::ErrorKind::Other, "Error: model was not initialized properly."));
         }
 
@@ -736,6 +787,7 @@ impl GPT2 {
             self.seq_len = t;
             // Resize activation tensors based on the current configuration and batch settings
             self.allocate_activation_tensors(b, t, l, nh, c, v);
+            self.allocate_grad_activation_tensors(b, t, l, nh, c, v)
         } else {
             // Ensure B and T are not larger than what was previously allocated
             if b > self.batch_size || t > self.seq_len {
@@ -964,7 +1016,30 @@ impl GPT2 {
     pub fn zero_grad(&mut self) {
         // Using the fill method to set all elements to zero
         self.grads_memory.fill(0.0);
-        self.grads_acts_memory.fill(0.0);
+        // Reset gradient activations
+        self.grads_acts.encoded.fill(0.0);
+        self.grads_acts.ln1.fill(0.0);
+        self.grads_acts.ln1_mean.fill(0.0);
+        self.grads_acts.ln1_rstd.fill(0.0);
+        self.grads_acts.qkv.fill(0.0);
+        self.grads_acts.atty.fill(0.0);
+        self.grads_acts.preatt.fill(0.0);
+        self.grads_acts.att.fill(0.0);
+        self.grads_acts.attproj.fill(0.0);
+        self.grads_acts.residual2.fill(0.0);
+        self.grads_acts.ln2.fill(0.0);
+        self.grads_acts.ln2_mean.fill(0.0);
+        self.grads_acts.ln2_rstd.fill(0.0);
+        self.grads_acts.fch.fill(0.0);
+        self.grads_acts.fch_gelu.fill(0.0);
+        self.grads_acts.fcproj.fill(0.0);
+        self.grads_acts.residual3.fill(0.0);
+        self.grads_acts.lnf.fill(0.0);
+        self.grads_acts.lnf_mean.fill(0.0);
+        self.grads_acts.lnf_rstd.fill(0.0);
+        self.grads_acts.logits.fill(0.0);
+        self.grads_acts.probs.fill(0.0);
+        self.grads_acts.losses.fill(0.0);
 
         // Alternatively, using an iterator method (commented out since fill is preferable):
         // self.grads_memory.iter_mut().for_each(|g| *g = 0.0);
@@ -986,11 +1061,6 @@ impl GPT2 {
             return Err(io::Error::new(io::ErrorKind::Other, "Error: must forward with targets before backward"));
         }
 
-        if self.grads_memory.is_empty() {
-            self.grads_memory.resize(self.num_parameters, 0.0);
-            self.grads_acts_memory.resize(self.num_activations, 0.0);
-            self.zero_grad();
-        }
 
         let b = self.batch_size;
         let t = self.seq_len;
@@ -998,12 +1068,35 @@ impl GPT2 {
         let l = self.config.num_layers;
         let c = self.config.channels;
         let nh = self.config.num_heads;
+
+        if self.grads_memory.is_empty() {
+            self.grads_memory.resize(self.num_parameters, 0.0);
+            self.allocate_grad_activation_tensors(b, t, l, nh, c, v);
+            self.zero_grad();
+        }
         let dloss_mean = 1.0/(b*t) as f32;
         self.grads_acts.losses.fill(dloss_mean);
 
-        crossentropy_softmax_backward(&mut self.grads_acts.logits, &mut self.grads_acts.losses, &self.acts.probs, &self.targets, b,t,v);
+        crossentropy_softmax_backward(
+            &mut self.grads_acts.logits,
+            &mut self.grads_acts.losses,
+            &self.acts.probs,
+            &self.targets,
+            b,
+            t,
+            v);
 
-        matmul_backward(&mut self.grads_acts.lnf, &mut self.grads.wte, None, &mut self.grads_acts.logits, &self.acts.lnf, &self.params.wte, b, t, c, v);
+        matmul_backward(
+            &mut self.grads_acts.lnf,
+            &mut self.grads.wte,
+            None,
+            &mut self.grads_acts.logits,
+            &self.acts.lnf,
+            &self.params.wte,
+            b,
+            t,
+            c,
+            v);
 
         //line816
         Ok(())
@@ -1151,7 +1244,7 @@ fn main() {
     let tiny_shakespeare_val: &Path = Path::new("/Users/stefano.bosisio/Documents/llm.rust/data/tiny_shakespeare_val.bin");
     // initialise B & T
     let B: usize = 4;
-    let T: usize = 64;
+    let T: usize = 1024;
     let val_num_batches = 10;
     // train loader
     let mut train_loader: DataLoader = DataLoader::new(tiny_shakespeare_train, B, T).unwrap();
@@ -1166,7 +1259,7 @@ fn main() {
     //let mut gen_tokens = [0; GEN_MAX_LENGTH];
     // init of the model
     model.mean_loss = 0.0;
-    for step in 0..20{
+    for step in 0..2{
         // Once in a while estimate the validation loss
         println!("Step: {}", step);
         // TODO CREATE THE INFERENCE PART
@@ -1176,10 +1269,10 @@ fn main() {
             train_loader.next_batch();
             model.zero_grad();
             model.forward(&train_loader.inputs, Some(&train_loader.targets), B, T);
-            //print!("train loss: {}", model.mean_loss);
-            // TODO gpt2_zero_grad
-            // TODO gpt2_backward
-            // TODO gpt2_update
+            println!("train loss: {}", model.mean_loss);
+            model.zero_grad();
+            println!("Backward");
+            model.backward();
         }
         if step % 10 == 0 {
             let mut val_loss = 0.0;
