@@ -5,6 +5,8 @@ use byteorder::{ReadBytesExt, LittleEndian};
 use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use atomic_float::AtomicF32;
+use std::sync::atomic::Ordering;
 
 use cblas::{sgemm, Layout, Transpose};
 use rayon::prelude::*;
@@ -208,7 +210,61 @@ fn not_optimized_matmul_forward(
 }
 
 
+
 fn matmul_backward(
+    dinp: &mut [f32],
+    dweight: &mut [f32],
+    dbias: Option<&[AtomicF32]>,
+    dout: &[f32],
+    inp: &[f32],
+    weight: &[f32],
+    B: usize,
+    T: usize,
+    C: usize,
+    OC: usize,
+) {
+    println!("dinp");
+    // Backward into dinp (same as before)
+    dinp.par_chunks_mut(C)
+        .zip(dout.par_chunks(OC))
+        .for_each(|(dinp_bt, dout_bt)| {
+            for o in 0..OC {
+                let wrow = &weight[o * C..(o + 1) * C];
+                let d = dout_bt[o];
+                for i in 0..C {
+                    dinp_bt[i] += wrow[i] * d;
+                }
+            }
+        });
+
+    println!("dweight");
+    // Backward into dweight and dbias with atomic dbias
+    dweight
+        .par_chunks_mut(C)
+        .enumerate()
+        .for_each(|(o, dwrow)| {
+            let mut dbias_o = 0.0f32;
+            for b in 0..B {
+                for t in 0..T {
+                    let idx = b * T + t;
+                    let dout_bt = &dout[idx * OC..(idx + 1) * OC];
+                    let inp_bt = &inp[idx * C..(idx + 1) * C];
+                    let d = dout_bt[o];
+                    dbias_o += d;
+                    for i in 0..C {
+                        dwrow[i] += inp_bt[i] * d;
+                    }
+                }
+            }
+            // Update dbias using atomic operation
+            if let Some(dbias) = &dbias {
+                dbias[o].fetch_add(dbias_o, Ordering::Relaxed);
+            }
+        });
+    println!("done");
+}
+
+fn matmul_backward_tester2(
     dinp: &mut [f32],
     dweight: &mut [f32],
     dbias: Option<&mut [f32]>,
@@ -220,58 +276,195 @@ fn matmul_backward(
     c: usize,
     oc: usize,
 ) {
-    // Parallel over B and T for backward into `dinp`
-    let dinp = Arc::new(Mutex::new(dinp)); // Wrap `dinp` in a Mutex and Arc for safe concurrent writes
-    (0..b).into_par_iter().for_each(|b_idx| {
-        let base_idx_inp = b_idx * t * c;
-        let base_idx_out = b_idx * t * oc;
+    println!("Initailize");
+    let m = (b * t) as i32; // Number of rows in dinp and dout
+    let n = c as i32;       // Number of columns in dinp and weight
+    let k = oc as i32;      // Number of columns in dout and rows in weight
 
-        (0..t).into_par_iter().for_each(|t_idx| {
-            let dout_bt = &dout[base_idx_out + t_idx * oc..][..oc];
-            let dinp_bt = &mut dinp.lock().unwrap()[base_idx_inp + t_idx * c..][..c];
+    let chunk_size_m = 64; // Adjust based on your system's memory capacity
+    let chunk_size_k = 64; // Adjust based on your system's memory capacity
 
-            for o in 0..oc {
-                let d = dout_bt[o];
-                let wrow = &weight[o * c..][..c];
-                for i in 0..c {
-                    dinp_bt[i] += wrow[i] * d;
-                }
-            }
-        });
-    });
+    // Compute dinp += dout * weight^T
+    // Process M and K dimensions in chunks
+    println!("Compute dinp");
+    for m_start in (0..m).step_by(chunk_size_m) {
+        let current_m = std::cmp::min(chunk_size_m as i32, m - m_start);
+        let m_offset = m_start as usize * k as usize;
 
-    // Parallel over OC for backward into `dweight` and `dbias`
-    let dweight = Arc::new(Mutex::new(dweight));
-    let dbias = dbias.map(|db| Arc::new(Mutex::new(db))); // Wrap `dbias` similarly if it's Some
+        for k_start in (0..k).step_by(chunk_size_k) {
+            let current_k = std::cmp::min(chunk_size_k as i32, k - k_start);
+            let k_offset = k_start as usize;
 
-    (0..oc).into_par_iter().for_each(|o| {
-        let mut dwrow = vec![0.0; c];
-        let mut dbias_accum = 0.0;
+            // Slices for dout_chunk and weight_chunk
+            let dout_chunk = &dout[m_offset + k_offset..];
+            let weight_chunk = &weight[k_offset * n as usize..];
 
-        for b_idx in 0..b {
-            for t_idx in 0..t {
-                let dout_bt = &dout[b_idx * t * oc + t_idx * oc..][..oc];
-                let inp_bt = &inp[b_idx * t * c + t_idx * c..][..c];
-                let d = dout_bt[o];
+            let dinp_offset = m_start as usize * n as usize;
+            let dinp_chunk = &mut dinp[dinp_offset..];
 
-                for i in 0..c {
-                    dwrow[i] += inp_bt[i] * d;
-                }
-                dbias_accum += d;
+            unsafe {
+                sgemm(
+                    Layout::RowMajor,
+                    Transpose::None,       // No transpose for dout_chunk
+                    Transpose::Ordinary,      // Transpose weight_chunk
+                    current_m,
+                    n,
+                    current_k,
+                    1.0,
+                    dout_chunk,
+                    k,  // lda = original K
+                    weight_chunk,
+                    n,  // ldb = N
+                    1.0,
+                    dinp_chunk,
+                    n,  // ldc = N
+                );
             }
         }
+    }
+    println!("Compute dweight");
+    // Compute dweight += dout^T * inp
+    // Process K and M dimensions in chunks
+    for k_start in (0..k).step_by(chunk_size_k) {
+        let current_k = std::cmp::min(chunk_size_k as i32, k - k_start);
+        let k_offset = k_start as usize;
 
-        let mut dweight_lock = dweight.lock().unwrap();
-        let dw_slice = &mut dweight_lock[o * c..(o + 1) * c];
-        dw_slice.copy_from_slice(&dwrow);
+        for m_start in (0..m).step_by(chunk_size_m) {
+            let current_m = std::cmp::min(chunk_size_m as i32, m - m_start);
+            let m_offset = m_start as usize * k as usize;
 
-        if let Some(ref dbias) = dbias {
-            let mut dbias_lock = dbias.lock().unwrap();
-            dbias_lock[o] += dbias_accum;
+            let dout_chunk = &dout[m_offset + k_offset..];
+            let inp_chunk = &inp[m_start as usize * n as usize..];
+            let dweight_chunk = &mut dweight[k_offset as usize * n as usize..];
+
+            unsafe {
+                sgemm(
+                    Layout::RowMajor,
+                    Transpose::Ordinary,      // Transpose dout_chunk
+                    Transpose::None,       // No transpose for inp_chunk
+                    current_k,
+                    n,
+                    current_m,
+                    1.0,
+                    dout_chunk,
+                    k,  // lda = K
+                    inp_chunk,
+                    n,  // ldb = N
+                    1.0,
+                    dweight_chunk,
+                    n,  // ldc = N
+                );
+            }
         }
-    });
+    }
+    println!("Collect");
+    // Compute dbias[o] += sum_{b, t} dout[b, t, o]
+    if let Some(dbias) = dbias {
+        let chunk_size_k = 1024; // Adjust as needed
+        for k_start in (0..k).step_by(chunk_size_k) {
+            let current_k = std::cmp::min(chunk_size_k as i32, k - k_start);
+            let dbias_chunk = &mut dbias[k_start as usize..(k_start + current_k) as usize];
+
+            dbias_chunk.par_iter_mut().enumerate().for_each(|(i, dbias_o)| {
+                let o = k_start as usize + i;
+                let sum: f32 = dout[o..]
+                    .iter()
+                    .step_by(oc)
+                    .take(b * t)
+                    .sum();
+                *dbias_o += sum;
+            });
+        }
+    }
 }
 
+fn matmul_backward_tester(
+    dinp: &mut [f32],
+    dweight: &mut [f32],
+    dbias: Option<&mut [f32]>,
+    dout: &[f32],
+    inp: &[f32],
+    weight: &[f32],
+    b: usize,
+    t: usize,
+    c: usize,
+    oc: usize,
+) {
+    let m = (b * t) as i32; // Number of rows in dinp and dout
+    let n = c as i32;       // Number of columns in dinp and weight
+    let k = oc as i32;      // Number of columns in dout and rows in weight
+
+    // Transpose weight into weight_t
+    let mut weight_t = vec![0.0f32; (k * n) as usize];
+    transpose_matrix(weight, &mut weight_t, k as usize, n as usize);
+    println!("Compute dinp");
+    // Compute dinp += dout * weight^T (using weight_t)
+    unsafe {
+        sgemm(
+            Layout::RowMajor,
+            Transpose::None,   // No transpose for dout
+            Transpose::None,   // No transpose for weight_t
+            m,
+            n,
+            k,
+            1.0,
+            dout,
+            k,  // lda = K
+            &weight_t,
+            n,  // ldb = N
+            1.0,
+            dinp,
+            n,  // ldc = N
+        );
+    }
+
+    // Transpose inp into inp_t
+    let mut inp_t = vec![0.0f32; (n * m) as usize];
+    transpose_matrix(inp, &mut inp_t, m as usize, n as usize);
+    println!("Compute dweight");
+    // Compute dweight += inp^T * dout
+    unsafe {
+        sgemm(
+            Layout::RowMajor,
+            Transpose::None,   // No transpose for inp_t
+            Transpose::None,   // No transpose for dout
+            n,
+            k,
+            m,
+            1.0,
+            &inp_t,
+            m,  // lda = M
+            dout,
+            k,  // ldb = K
+            1.0,
+            dweight,
+            k,  // ldc = K
+        );
+    }
+    println!("Do the collection ");
+    // Compute dbias[o] += sum_{b, t} dout[b, t, o]
+    if let Some(dbias) = dbias {
+        dbias.par_iter_mut()
+            .enumerate()
+            .for_each(|(o, dbias_o)| {
+                let sum: f32 = dout[o..]
+                    .iter()
+                    .step_by(oc)
+                    .take(b * t)
+                    .sum();
+                *dbias_o += sum;
+            });
+    }
+}
+
+// Helper function to transpose a matrix
+fn transpose_matrix(src: &[f32], dst: &mut [f32], rows: usize, cols: usize) {
+    for i in 0..rows {
+        for j in 0..cols {
+            dst[j * rows + i] = src[i * cols + j];
+        }
+    }
+}
 
 fn attention_forward(
     out: &mut [f32],
@@ -864,7 +1057,7 @@ impl GPT2 {
             let l_ln2_rstd = &mut self.acts.ln2_rstd[l*self.batch_size*self.seq_len..(l+1)*self.batch_size*self.seq_len];
             let l_fch = &mut self.acts.fch[index_base*4..next_index_base*4];
             let l_fch_gelu = &mut self.acts.fch_gelu[index_base*4..next_index_base*4];
-            let l_fcproj = &mut self.acts.fcproj[index_base..next_index_base];
+            let l_fcproj: &mut [f32] = &mut self.acts.fcproj[index_base..next_index_base];
             let l_residual3 = &mut self.acts.residual3[index_base..next_index_base];
 
             // FORWARD PASS
@@ -1274,12 +1467,17 @@ fn main() {
             println!("Backward");
             model.backward();
         }
+        println!("validation");
         if step % 10 == 0 {
             let mut val_loss = 0.0;
+            println!("validation reset");
             val_loader.reset();
             for _ in 0..val_num_batches {
+                println!("validation nexdt batch ");
                 val_loader.next_batch();
+                println!("model forward for validation");
                 model.forward(&val_loader.inputs, Some(&val_loader.targets), B, T);
+                println!("val loss");
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches as f32;
