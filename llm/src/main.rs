@@ -1294,6 +1294,57 @@ impl GPT2 {
         //line816
         Ok(())
     }
+    pub fn update(&mut self, learning_rate: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32, t: usize) {
+        // Lazily allocate m_memory and v_memory if they are empty
+        if self.m_memory.is_empty() {
+            self.m_memory = vec![0.0; self.num_parameters];
+            self.v_memory = vec![0.0; self.num_parameters];
+        }
+
+        for i in 0..self.num_parameters {
+            let param = self.params_memory[i];
+            let grad = self.grads_memory[i];
+
+            // Update the first moment estimate
+            let m = beta1 * self.m_memory[i] + (1.0 - beta1) * grad;
+            // Update the second moment estimate
+            let v = beta2 * self.v_memory[i] + (1.0 - beta2) * grad * grad;
+            // Bias-corrected moment estimates
+            let m_hat = m / (1.0 - beta1.powi(t as i32));
+            let v_hat = v / (1.0 - beta2.powi(t as i32));
+
+            // Update the parameter using AdamW update rule
+            self.params_memory[i] -= learning_rate * (m_hat / (v_hat.sqrt() + eps) + weight_decay * param);
+
+            // Update the moments
+            self.m_memory[i] = m;
+            self.v_memory[i] = v;
+        }
+
+        // After updating params_memory, update individual parameter slices
+        self.update_param_slices();
+    }
+
+    fn update_param_slices(&mut self) {
+        // Update individual parameter slices after params_memory changes
+        let mut offset = 0;
+        self.params.wte.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[0]]); offset += self.param_sizes[0];
+        self.params.wpe.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[1]]); offset += self.param_sizes[1];
+        self.params.ln1w.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[2]]); offset += self.param_sizes[2];
+        self.params.ln1b.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[3]]); offset += self.param_sizes[3];
+        self.params.qkvw.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[4]]); offset += self.param_sizes[4];
+        self.params.qkvb.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[5]]); offset += self.param_sizes[5];
+        self.params.attprojw.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[6]]); offset += self.param_sizes[6];
+        self.params.attprojb.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[7]]); offset += self.param_sizes[7];
+        self.params.ln2w.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[8]]); offset += self.param_sizes[8];
+        self.params.ln2b.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[9]]); offset += self.param_sizes[9];
+        self.params.fcw.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[10]]); offset += self.param_sizes[10];
+        self.params.fcb.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[11]]); offset += self.param_sizes[11];
+        self.params.fcprojw.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[12]]); offset += self.param_sizes[12];
+        self.params.fcprojb.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[13]]); offset += self.param_sizes[13];
+        self.params.lnfw.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[14]]); offset += self.param_sizes[14];
+        self.params.lnfb.copy_from_slice(&self.params_memory[offset..offset + self.param_sizes[15]]);
+    }
 
 }
 /* END OF GPT2 CONFIGURATION */
@@ -1463,9 +1514,12 @@ fn main() {
             model.zero_grad();
             model.forward(&train_loader.inputs, Some(&train_loader.targets), B, T);
             println!("train loss: {}", model.mean_loss);
-            model.zero_grad();
             println!("Backward");
             model.backward();
+            let grad_mean: f32 = model.grads_memory.iter().sum::<f32>() / model.grads_memory.len() as f32;
+            println!("Gradient mean: {}", grad_mean);
+            println!("Update");
+            model.update(1e-4, 0.9, 0.999, 1e-8, 0.0, step+1);
         }
         println!("validation");
         if step % 10 == 0 {
