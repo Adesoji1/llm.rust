@@ -1,2 +1,4 @@
 */target
 matmul/
+c_code/matmul_example
+c_code/test_openmp.c
