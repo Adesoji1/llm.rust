@@ -89,6 +89,60 @@ fn layernorm_forward(
     }
 }
 
+fn layernorm_backward(
+    dinp: &mut [f32],
+    dweight: &mut [f32],
+    dbias: &mut [f32],
+    dout: &[f32],
+    inp: &[f32],
+    weight: &[f32],
+    mean: &[f32],
+    rstd: &[f32],
+    b: usize,
+    t: usize,
+    c: usize,
+) {
+    for b_idx in 0..b {
+        for t_idx in 0..t {
+            let start_idx = b_idx * t * c + t_idx * c;
+            let dout_bt = &dout[start_idx..start_idx + c];
+            let inp_bt = &inp[start_idx..start_idx + c];
+            let dinp_bt = &mut dinp[start_idx..start_idx + c];
+            let mean_bt = mean[b_idx * t + t_idx];
+            let rstd_bt = rstd[b_idx * t + t_idx];
+
+            // First: two reduce operations
+            let mut dnorm_mean = 0.0f32;
+            let mut dnorm_norm_mean = 0.0f32;
+
+            for i in 0..c {
+                let norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+                let dnorm_i = weight[i] * dout_bt[i];
+                dnorm_mean += dnorm_i;
+                dnorm_norm_mean += dnorm_i * norm_bti;
+            }
+
+            dnorm_mean /= c as f32;
+            dnorm_norm_mean /= c as f32;
+
+            // Now iterate again and accumulate all the gradients
+            for i in 0..c {
+                let norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+                let dnorm_i = weight[i] * dout_bt[i];
+                // Gradient contribution to bias
+                dbias[i] += dout_bt[i];
+                // Gradient contribution to weight
+                dweight[i] += norm_bti * dout_bt[i];
+                // Gradient contribution to input
+                let mut dval = dnorm_i; // Term 1
+                dval -= dnorm_mean; // Term 2
+                dval -= norm_bti * dnorm_norm_mean; // Term 3
+                dval *= rstd_bt; // Final scale
+                dinp_bt[i] += dval;
+            }
+        }
+    }
+}
 
 
 fn matmul_forward(
@@ -1209,6 +1263,23 @@ impl GPT2 {
     pub fn zero_grad(&mut self) {
         // Using the fill method to set all elements to zero
         self.grads_memory.fill(0.0);
+        // Reset the gradients for parameters
+        self.grads.wte.fill(0.0);
+        self.grads.wpe.fill(0.0);
+        self.grads.ln1w.fill(0.0);
+        self.grads.ln1b.fill(0.0);
+        self.grads.qkvw.fill(0.0);
+        self.grads.qkvb.fill(0.0);
+        self.grads.attprojw.fill(0.0);
+        self.grads.attprojb.fill(0.0);
+        self.grads.ln2w.fill(0.0);
+        self.grads.ln2b.fill(0.0);
+        self.grads.fcw.fill(0.0);
+        self.grads.fcb.fill(0.0);
+        self.grads.fcprojw.fill(0.0);
+        self.grads.fcprojb.fill(0.0);
+        self.grads.lnfw.fill(0.0);
+        self.grads.lnfb.fill(0.0);
         // Reset gradient activations
         self.grads_acts.encoded.fill(0.0);
         self.grads_acts.ln1.fill(0.0);
@@ -1292,8 +1363,27 @@ impl GPT2 {
             v);
 
         //line816
+        let residual_start = (l - 1) * b * t * c;
+        let residual_end = residual_start + b * t * c;
+
+        let residual = &self.acts.residual3[residual_start..residual_end];
+        let mut dresidual = &mut self.grads_acts.residual3[residual_start..residual_end];
+
+        layernorm_backward(&mut dresidual,
+            &mut self.grads.lnfw,
+            &mut self.grads.lnfb,
+            &mut self.grads_acts.lnf,
+            & residual,
+            &self.params.lnfw,
+            &self.acts.lnf_mean,
+            &self.acts.lnf_rstd,
+            b,
+            t,
+            c);
+
         Ok(())
     }
+
     pub fn update(&mut self, learning_rate: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32, t: usize) {
         // Lazily allocate m_memory and v_memory if they are empty
         if self.m_memory.is_empty() {
