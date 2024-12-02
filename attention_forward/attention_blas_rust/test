@@ -1,0 +1,148 @@
+use cblas::{sgemm, Layout, Transpose};
+
+fn attention_forward_blas(
+    out: &mut [f32],
+    inp: &[f32],
+    b: usize,
+    t: usize,
+    c: usize,
+    nh: usize,
+) {
+    let hs = c / nh; // Head size
+    let scale = 1.0 / (hs as f32).sqrt();
+    let c3 = c * 3;
+
+    // Step 1: Separate Q, K, V from inp
+    let mut q = vec![0.0f32; b * t * nh * hs];
+    let mut k = vec![0.0f32; b * t * nh * hs];
+    let mut v = vec![0.0f32; b * t * nh * hs];
+    let mut att_scores = vec![0.0f32; b * nh * t * t];
+    let mut out_per_head = vec![0.0f32; b * nh * t * hs];
+
+    for b_idx in 0..b {
+        for t_idx in 0..t {
+            for h in 0..nh {
+                for i in 0..hs {
+                    let inp_base = b_idx * t * c3 + t_idx * c3 + h * hs + i;
+                    let q_idx = b_idx * t * nh * hs + t_idx * nh * hs + h * hs + i;
+                    q[q_idx] = inp[inp_base];
+                    k[q_idx] = inp[inp_base + c];
+                    v[q_idx] = inp[inp_base + 2 * c];
+                }
+            }
+        }
+    }
+
+    // Step 2: Compute Attention Scores using sgemm
+    let alpha = scale; // Scaling factor
+    let beta = 0.0;
+
+    for b_idx in 0..b {
+        for h in 0..nh {
+            let q_start = b_idx * t * nh * hs + h * t * hs;
+            let k_start = q_start;
+            let att_start = b_idx * nh * t * t + h * t * t;
+
+            let q_matrix = &q[q_start..q_start + t * hs];
+            let k_matrix = &k[k_start..k_start + t * hs];
+            let att_matrix = &mut att_scores[att_start..att_start + t * t];
+
+            unsafe {
+                sgemm(
+                    Layout::RowMajor,
+                    Transpose::None,
+                    Transpose::Trans,
+                    t as i32,
+                    t as i32,
+                    hs as i32,
+                    alpha,
+                    q_matrix,
+                    hs as i32,
+                    k_matrix,
+                    hs as i32,
+                    beta,
+                    att_matrix,
+                    t as i32,
+                );
+            }
+        }
+    }
+
+    // Step 3: Apply Softmax with causal masking
+    for b_idx in 0..b {
+        for h in 0..nh {
+            for t_idx in 0..t {
+                let att_row_start = b_idx * nh * t * t + h * t * t + t_idx * t;
+                let att_row = &mut att_scores[att_row_start..att_row_start + t];
+
+                // Causal masking: Set positions where t2 > t_idx to negative infinity
+                for t2 in t_idx + 1..t {
+                    att_row[t2] = f32::NEG_INFINITY;
+                }
+
+                // Subtract max for numerical stability
+                let max_val = att_row[..=t_idx].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                for val in att_row.iter_mut() {
+                    *val = (*val - max_val).exp();
+                }
+
+                // Compute sum and normalize
+                let sum: f32 = att_row[..=t_idx].iter().sum();
+                for val in att_row.iter_mut() {
+                    *val /= sum;
+                }
+            }
+        }
+    }
+
+    // **Corrected Step 4: Compute Output per Head using sgemm**
+    for b_idx in 0..b {
+        for h in 0..nh {
+            let att_start = b_idx * nh * t * t + h * t * t;
+            let v_start = b_idx * t * nh * hs + h * t * hs;
+            let out_start = b_idx * nh * t * hs + h * t * hs;
+
+            let att_matrix = &att_scores[att_start..att_start + t * t];
+            let v_matrix = &v[v_start..v_start + t * hs];
+            let out_matrix = &mut out_per_head[out_start..out_start + t * hs];
+
+            unsafe {
+                sgemm(
+                    Layout::RowMajor,
+                    Transpose::None,
+                    Transpose::None,
+                    t as i32, // M
+                    hs as i32, // N
+                    t as i32,  // K
+                    1.0,
+                    att_matrix,
+                    t as i32,
+                    v_matrix,
+                    hs as i32,
+                    0.0,
+                    out_matrix,
+                    hs as i32,
+                );
+            }
+        }
+    }
+
+    // **Corrected Step 5: Combine Heads into out**
+    for b_idx in 0..b {
+        for t_idx in 0..t {
+            let out_start = b_idx * t * c + t_idx * c;
+            let mut out_offset = 0;
+            for h in 0..nh {
+                let head_output_start = b_idx * nh * t * hs + h * t * hs + t_idx * hs;
+                out[out_start + out_offset..out_start + out_offset + hs]
+                    .copy_from_slice(&out_per_head[head_output_start..head_output_start + hs]);
+                out_offset += hs;
+            }
+        }
+    }
+}
+
+fn main() {
+    // Your main function remains the same
+    // ...
+}
