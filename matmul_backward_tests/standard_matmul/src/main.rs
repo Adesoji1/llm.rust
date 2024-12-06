@@ -148,7 +148,7 @@ fn main() {
     matmul_backward_standard(&mut dinp, &mut dweight, Some(&mut dbias[..]), &mut dout, &inp, &weight, b, t, c, oc);
     let elapsed = now.elapsed();
     println!("Time taken: {:?}", elapsed);
-    println!("dout {:?}", dout);
+    //println!("dout {:?}", dout);
     //println!("dinp {:?}", dinp);
     //println!("Output Tensor:");
     //println!("First batch {:?}", &out[0..10]);

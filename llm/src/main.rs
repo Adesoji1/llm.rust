@@ -10,6 +10,8 @@ use std::sync::atomic::Ordering;
 
 use cblas::{sgemm, Layout, Transpose};
 use rayon::prelude::*;
+
+
 /*Exaplanation for mutex
  rayon expects the data being mutated to be isolated per iteration to avoid data races. Since out is a mutable reference that multiple threads attempt to access simultaneously, Rust prevents this to ensure safety.
 
@@ -89,6 +91,7 @@ fn layernorm_forward(
     }
 }
 
+
 fn layernorm_backward(
     dinp: &mut [f32],
     dweight: &mut [f32],
@@ -161,15 +164,17 @@ fn matmul_forward(
 
     // Leading dimensions for Row-Major layout
     let lda = k; // lda >= K
-    let ldb = n; // ldb >= N
+    let ldb = k; // ldb >= N
     let ldc = n; // ldc >= N
+
+    //println!("m: {m}, k: {k}, n: {n}, lda: {lda}, ldb: {ldb}, ldc: {ldc}");
 
     // Perform the matrix multiplication using BLAS sgemm
     unsafe {
         sgemm(
             Layout::RowMajor,
             Transpose::None, // Transpose of A ('N' for no transpose)
-            Transpose::None, // Transpose of B
+            Transpose::Ordinary, // Transpose of B
             m,
             n,
             k,
@@ -196,74 +201,79 @@ fn matmul_forward(
 }
 
 
-
-fn not_optimized_matmul_forward(
-    out: &mut [f32],
+fn matmul_backward_blas(
+    dinp: &mut [f32],
+    dweight: &mut [f32],
+    dbias: Option<&mut [f32]>,
+    dout: &[f32],
     inp: &[f32],
     weight: &[f32],
-    bias: Option<&[f32]>, // option because we may have None
-    b: usize,
-    t: usize,
-    c: usize,
-    oc: usize,
-)
-    // Main multiplication function
-    // OC is output channels
-    // input is (B, T, C), weight is (OC, C), bias is (OC)
-    // output will be (B, T, OC)
+    b: usize,   // Batch size
+    t: usize,   // Time steps or sequence length
+    c: usize,   // Input channels
+    oc: usize,  // Output channels
+) {
+    use cblas::{sgemm, Layout, Transpose};
 
-    // {
-    // for (b_idx, chunk) in inp.chunks(t * c).enumerate().take(b) {
-    //     for (t_idx, inp_bt) in chunk.chunks(c).enumerate().take(t) {
-    //         let out_bt = &mut out[b_idx * t * oc + t_idx * oc..][..oc];
-    //         for (o, output) in out_bt.iter_mut().enumerate().take(oc) {
-    //             let bias_val = bias.map_or(0.0, |b| b[o]);
-    //             let weight_row = &weight[o * c..][..c];
-    //             let val = inp_bt
-    //                 .iter()
-    //                 .zip(weight_row.iter())
-    //                 .fold(bias_val, |acc, (&inp_val, &weight_val)| acc + inp_val * weight_val);
-    //             *output = val;
-    //         }
-    //     }
-    // }
-    // }
-{
-    // Ensure the input slice has the expected size
-    //assert_eq!(inp.len(), b * t * c, "Input size is incorrect");
-    println!("b: {}, t: {}, c: {}, oc: {}", b, t, c, oc);
-    let out = Mutex::new(out); // Wrap `out` in a Mutex to allow safe concurrent writes
+    let m = (b * t) as i32; // Number of rows in dout and dinp
+    let k = oc as i32;      // Number of columns in dout and rows in weight
+    let n = c as i32;       // Number of columns in weight and dinp
 
-    (0..b).into_par_iter().for_each(|b_idx| {
-        let start_idx = b_idx * t * c;
-        let end_idx = (b_idx + 1) * t * c;
+    // Compute dinp = dout * weight
+    unsafe {
+        sgemm(
+            Layout::RowMajor,
+            Transpose::None,     // No transpose for dout
+            Transpose::None,     // No transpose for weight
+            m,
+            n,
+            k,
+            1.0,
+            dout,
+            k,                   // lda >= K (set to k)
+            weight,
+            n,                   // ldb >= N (set to n)
+            0.0,
+            dinp,
+            n,                   // ldc >= N (set to n)
+        );
+    }
 
-        // Ensure the indices are within bounds
-        if start_idx >= inp.len() || end_idx > inp.len() {
-            return; // Skip this iteration if indices are out of bounds
-        }
+    let m_dw = oc as i32;      // Number of rows in dweight and dout^T
+    let k_dw = (b * t) as i32; // Number of columns in dout^T and rows in inp
+    let n_dw = c as i32;       // Number of columns in inp and dweight
 
-        for (t_idx, inp_bt) in inp[start_idx..end_idx].chunks(c).enumerate() {
-            let mut out_bt = vec![0.0; oc]; // Temporary buffer for the current (B, T) output
-            for (o, output) in out_bt.iter_mut().enumerate().take(oc) {
-                let bias_val = bias.map_or(0.0, |b| b[o]);
-                let weight_row = &weight[o * c..][..c];
-                let val = inp_bt
-                    .iter()
-                    .zip(weight_row.iter())
-                    .fold(bias_val, |acc, (&inp_val, &weight_val)| acc + inp_val * weight_val);
-                *output = val;
+    // Compute dweight = dout^T * inp
+    unsafe {
+        sgemm(
+            Layout::RowMajor,
+            Transpose::Ordinary, // Transpose dout
+            Transpose::None,     // No transpose for inp
+            m_dw,
+            n_dw,
+            k_dw,
+            1.0,
+            dout,
+            m_dw,                // lda >= M (set to m_dw)
+            inp,
+            n_dw,                // ldb >= N (set to n_dw)
+            0.0,
+            dweight,
+            n_dw,                // ldc >= N (set to n_dw)
+        );
+    }
+
+    // Compute dbias = sum over batches and time steps of dout
+    if let Some(dbias) = dbias {
+        for o in 0..oc {
+            let mut sum = 0.0f32;
+            for bt in 0..(b * t) {
+                sum += dout[bt * oc + o];
             }
-            // Write back to the main output
-            let mut out_lock = out.lock().unwrap(); // Lock the Mutex to get mutable access
-            out_lock[b_idx * t * oc + t_idx * oc..b_idx * t * oc + (t_idx + 1) * oc]
-                .copy_from_slice(&out_bt);
+            dbias[o] += sum;
         }
-    });
-
+    }
 }
-
-
 
 fn matmul_backward(
     dinp: &mut [f32],
@@ -318,207 +328,6 @@ fn matmul_backward(
     println!("done");
 }
 
-fn matmul_backward_tester2(
-    dinp: &mut [f32],
-    dweight: &mut [f32],
-    dbias: Option<&mut [f32]>,
-    dout: &[f32],
-    inp: &[f32],
-    weight: &[f32],
-    b: usize,
-    t: usize,
-    c: usize,
-    oc: usize,
-) {
-    println!("Initailize");
-    let m = (b * t) as i32; // Number of rows in dinp and dout
-    let n = c as i32;       // Number of columns in dinp and weight
-    let k = oc as i32;      // Number of columns in dout and rows in weight
-
-    let chunk_size_m = 64; // Adjust based on your system's memory capacity
-    let chunk_size_k = 64; // Adjust based on your system's memory capacity
-
-    // Compute dinp += dout * weight^T
-    // Process M and K dimensions in chunks
-    println!("Compute dinp");
-    for m_start in (0..m).step_by(chunk_size_m) {
-        let current_m = std::cmp::min(chunk_size_m as i32, m - m_start);
-        let m_offset = m_start as usize * k as usize;
-
-        for k_start in (0..k).step_by(chunk_size_k) {
-            let current_k = std::cmp::min(chunk_size_k as i32, k - k_start);
-            let k_offset = k_start as usize;
-
-            // Slices for dout_chunk and weight_chunk
-            let dout_chunk = &dout[m_offset + k_offset..];
-            let weight_chunk = &weight[k_offset * n as usize..];
-
-            let dinp_offset = m_start as usize * n as usize;
-            let dinp_chunk = &mut dinp[dinp_offset..];
-
-            unsafe {
-                sgemm(
-                    Layout::RowMajor,
-                    Transpose::None,       // No transpose for dout_chunk
-                    Transpose::Ordinary,      // Transpose weight_chunk
-                    current_m,
-                    n,
-                    current_k,
-                    1.0,
-                    dout_chunk,
-                    k,  // lda = original K
-                    weight_chunk,
-                    n,  // ldb = N
-                    1.0,
-                    dinp_chunk,
-                    n,  // ldc = N
-                );
-            }
-        }
-    }
-    println!("Compute dweight");
-    // Compute dweight += dout^T * inp
-    // Process K and M dimensions in chunks
-    for k_start in (0..k).step_by(chunk_size_k) {
-        let current_k = std::cmp::min(chunk_size_k as i32, k - k_start);
-        let k_offset = k_start as usize;
-
-        for m_start in (0..m).step_by(chunk_size_m) {
-            let current_m = std::cmp::min(chunk_size_m as i32, m - m_start);
-            let m_offset = m_start as usize * k as usize;
-
-            let dout_chunk = &dout[m_offset + k_offset..];
-            let inp_chunk = &inp[m_start as usize * n as usize..];
-            let dweight_chunk = &mut dweight[k_offset as usize * n as usize..];
-
-            unsafe {
-                sgemm(
-                    Layout::RowMajor,
-                    Transpose::Ordinary,      // Transpose dout_chunk
-                    Transpose::None,       // No transpose for inp_chunk
-                    current_k,
-                    n,
-                    current_m,
-                    1.0,
-                    dout_chunk,
-                    k,  // lda = K
-                    inp_chunk,
-                    n,  // ldb = N
-                    1.0,
-                    dweight_chunk,
-                    n,  // ldc = N
-                );
-            }
-        }
-    }
-    println!("Collect");
-    // Compute dbias[o] += sum_{b, t} dout[b, t, o]
-    if let Some(dbias) = dbias {
-        let chunk_size_k = 1024; // Adjust as needed
-        for k_start in (0..k).step_by(chunk_size_k) {
-            let current_k = std::cmp::min(chunk_size_k as i32, k - k_start);
-            let dbias_chunk = &mut dbias[k_start as usize..(k_start + current_k) as usize];
-
-            dbias_chunk.par_iter_mut().enumerate().for_each(|(i, dbias_o)| {
-                let o = k_start as usize + i;
-                let sum: f32 = dout[o..]
-                    .iter()
-                    .step_by(oc)
-                    .take(b * t)
-                    .sum();
-                *dbias_o += sum;
-            });
-        }
-    }
-}
-
-fn matmul_backward_tester(
-    dinp: &mut [f32],
-    dweight: &mut [f32],
-    dbias: Option<&mut [f32]>,
-    dout: &[f32],
-    inp: &[f32],
-    weight: &[f32],
-    b: usize,
-    t: usize,
-    c: usize,
-    oc: usize,
-) {
-    let m = (b * t) as i32; // Number of rows in dinp and dout
-    let n = c as i32;       // Number of columns in dinp and weight
-    let k = oc as i32;      // Number of columns in dout and rows in weight
-
-    // Transpose weight into weight_t
-    let mut weight_t = vec![0.0f32; (k * n) as usize];
-    transpose_matrix(weight, &mut weight_t, k as usize, n as usize);
-    println!("Compute dinp");
-    // Compute dinp += dout * weight^T (using weight_t)
-    unsafe {
-        sgemm(
-            Layout::RowMajor,
-            Transpose::None,   // No transpose for dout
-            Transpose::None,   // No transpose for weight_t
-            m,
-            n,
-            k,
-            1.0,
-            dout,
-            k,  // lda = K
-            &weight_t,
-            n,  // ldb = N
-            1.0,
-            dinp,
-            n,  // ldc = N
-        );
-    }
-
-    // Transpose inp into inp_t
-    let mut inp_t = vec![0.0f32; (n * m) as usize];
-    transpose_matrix(inp, &mut inp_t, m as usize, n as usize);
-    println!("Compute dweight");
-    // Compute dweight += inp^T * dout
-    unsafe {
-        sgemm(
-            Layout::RowMajor,
-            Transpose::None,   // No transpose for inp_t
-            Transpose::None,   // No transpose for dout
-            n,
-            k,
-            m,
-            1.0,
-            &inp_t,
-            m,  // lda = M
-            dout,
-            k,  // ldb = K
-            1.0,
-            dweight,
-            k,  // ldc = K
-        );
-    }
-    println!("Do the collection ");
-    // Compute dbias[o] += sum_{b, t} dout[b, t, o]
-    if let Some(dbias) = dbias {
-        dbias.par_iter_mut()
-            .enumerate()
-            .for_each(|(o, dbias_o)| {
-                let sum: f32 = dout[o..]
-                    .iter()
-                    .step_by(oc)
-                    .take(b * t)
-                    .sum();
-                *dbias_o += sum;
-            });
-    }
-}
-
-// Helper function to transpose a matrix
-fn transpose_matrix(src: &[f32], dst: &mut [f32], rows: usize, cols: usize) {
-    for i in 0..rows {
-        for j in 0..cols {
-            dst[j * rows + i] = src[i * cols + j];
-        }
-    }
-}
 
 fn attention_forward(
     out: &mut [f32],
@@ -533,6 +342,7 @@ fn attention_forward(
     let c3 = c * 3;
     let hs = c / nh; // head size
     let scale = 1.0 / (hs as f32).sqrt();
+
     for b_idx in 0..b {
         for t_idx in 0..t {
             for h in 0..nh {
@@ -540,55 +350,108 @@ fn attention_forward(
                 let preatt_start = b_idx * nh * t * t + h * t * t + t_idx * t;
                 let att_start = b_idx * nh * t * t + h * t * t + t_idx * t;
 
-                // Pass 1: calculate query dot key and maxval
-                let mut maxval = f32::NEG_INFINITY;
+                // Extract the query vector Q: shape (hs)
+                let query_vec = &inp[query_start..query_start + hs]; // shape: hs
+
+                // Construct keys_mat: (t_idx+1) x hs
+                let mut keys_mat = Vec::with_capacity((t_idx + 1) * hs);
                 for t2 in 0..=t_idx {
-                    let key_start = b_idx * t * c3 + t2 * c3 + h * hs + c; // +C because it's key
-
-                    // (query_t) dot (key_t2)
-                    let mut val = 0.0;
-                    for i in 0..hs {
-                        val += inp[query_start + i] * inp[key_start + i];
-                    }
-                    val *= scale;
-                    if val > maxval {
-                        maxval = val;
-                    }
-
-                    preatt[preatt_start + t2] = val;
+                    let key_start = b_idx * t * c3 + t2 * c3 + h * hs + c; // +c for keys
+                    keys_mat.extend_from_slice(&inp[key_start..key_start + hs]);
                 }
 
-                // Pass 2: calculate the exp and keep track of sum
+                // We'll now compute preatt_row = keys_mat * query_vec
+                // keys_mat: (t_idx+1) x hs
+                // query_vec: hs x 1
+                // result = preatt_row: (t_idx+1) x 1
+                let mut preatt_row = vec![0.0f32; t_idx + 1];
+
+                unsafe {
+                    sgemm(
+                        Layout::RowMajor,
+                        Transpose::None,   // A as is: (t_idx+1) x hs
+                        Transpose::None,   // B as is: hs x 1
+                        (t_idx + 1) as i32, // m
+                        1,                  // n
+                        hs as i32,          // k
+                        1.0,                // alpha
+                        &keys_mat,          // A
+                        hs as i32,          // lda = hs
+                        query_vec,          // B
+                        1,                  // ldb = 1 (because B is hs x 1)
+                        0.0,                // beta
+                        &mut preatt_row,    // C
+                        1,                  // ldc = 1
+                    );
+                }
+
+                // Apply scaling
+                for val in &mut preatt_row {
+                    *val *= scale;
+                }
+
+                // Softmax over preatt_row[0..=t_idx]
+                let maxval = preatt_row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
                 let mut expsum = 0.0;
                 for t2 in 0..=t_idx {
-                    let expv = ((preatt[preatt_start + t2] - maxval).exp()).min(f32::MAX);
+                    let expv = (preatt_row[t2] - maxval).exp().min(f32::MAX);
                     expsum += expv;
                     att[att_start + t2] = expv;
+                    preatt[preatt_start + t2] = preatt_row[t2];
                 }
+
                 let expsum_inv = if expsum == 0.0 { 0.0 } else { 1.0 / expsum };
 
-                // Pass 3: normalize to get the softmax
                 for t2 in 0..t {
                     if t2 <= t_idx {
                         att[att_start + t2] *= expsum_inv;
                     } else {
-                        // causal attention mask, set to zero
                         att[att_start + t2] = 0.0;
                     }
                 }
 
-                // Pass 4: accumulate weighted values into the output of attention
                 let out_start = b_idx * t * c + t_idx * c + h * hs;
                 for i in 0..hs {
                     out[out_start + i] = 0.0;
                 }
+
+                // Construct values_mat: (t_idx+1) x hs
+                let att_row = &att[att_start..att_start + (t_idx + 1)];
+                let mut values_mat = Vec::with_capacity((t_idx + 1) * hs);
                 for t2 in 0..=t_idx {
-                    let value_start = b_idx * t * c3 + t2 * c3 + h * hs + c * 2; // +C*2 because it's value
-                    let att_val = att[att_start + t2];
-                    for i in 0..hs {
-                        out[out_start + i] += att_val * inp[value_start + i];
-                    }
+                    let value_start = b_idx * t * c3 + t2 * c3 + h * hs + c * 2;
+                    values_mat.extend_from_slice(&inp[value_start..value_start + hs]);
                 }
+
+                let mut out_vec = vec![0.0f32; hs];
+
+                // Now out_vec = att_row(1 x (t_idx+1)) * values_mat((t_idx+1) x hs)
+                // Dimensions for sgemm:
+                // A = att_row: (1 x (t_idx+1))
+                // B = values_mat: ((t_idx+1) x hs)
+                // C = out_vec: (1 x hs)
+                // M=1, N=hs, K=(t_idx+1)
+                unsafe {
+                    sgemm(
+                        Layout::RowMajor,
+                        Transpose::None,   // A is (1x(t_idx+1))
+                        Transpose::None,   // B is ((t_idx+1)xhs)
+                        1,                 // M=1
+                        hs as i32,         // N=hs
+                        (t_idx + 1) as i32, // K=(t_idx+1)
+                        1.0,               // alpha
+                        att_row,           // A, lda=(t_idx+1)
+                        (t_idx + 1) as i32,
+                        &values_mat,       // B, ldb=hs
+                        hs as i32,
+                        0.0,               // beta
+                        &mut out_vec,      // C, ldc=hs
+                        hs as i32,
+                    );
+                }
+
+                out[out_start..out_start + hs].copy_from_slice(&out_vec);
             }
         }
     }
@@ -1605,27 +1468,27 @@ fn main() {
             model.forward(&train_loader.inputs, Some(&train_loader.targets), B, T);
             println!("train loss: {}", model.mean_loss);
             println!("Backward");
-            model.backward();
-            let grad_mean: f32 = model.grads_memory.iter().sum::<f32>() / model.grads_memory.len() as f32;
-            println!("Gradient mean: {}", grad_mean);
-            println!("Update");
-            model.update(1e-4, 0.9, 0.999, 1e-8, 0.0, step+1);
+            // model.backward();
+            // let grad_mean: f32 = model.grads_memory.iter().sum::<f32>() / model.grads_memory.len() as f32;
+            // println!("Gradient mean: {}", grad_mean);
+            // println!("Update");
+            // model.update(1e-4, 0.9, 0.999, 1e-8, 0.0, step+1);
         }
         println!("validation");
-        if step % 10 == 0 {
-            let mut val_loss = 0.0;
-            println!("validation reset");
-            val_loader.reset();
-            for _ in 0..val_num_batches {
-                println!("validation nexdt batch ");
-                val_loader.next_batch();
-                println!("model forward for validation");
-                model.forward(&val_loader.inputs, Some(&val_loader.targets), B, T);
-                println!("val loss");
-                val_loss += model.mean_loss;
-            }
-            val_loss /= val_num_batches as f32;
-            println!("val loss: {}", val_loss);
-        }
+        // if step % 10 == 0 {
+        //     let mut val_loss = 0.0;
+        //     println!("validation reset");
+        //     val_loader.reset();
+        //     for _ in 0..val_num_batches {
+        //         println!("validation nexdt batch ");
+        //         val_loader.next_batch();
+        //         println!("model forward for validation");
+        //         model.forward(&val_loader.inputs, Some(&val_loader.targets), B, T);
+        //         println!("val loss");
+        //         val_loss += model.mean_loss;
+        //     }
+        //     val_loss /= val_num_batches as f32;
+        //     println!("val loss: {}", val_loss);
+        // }
     }
 }

@@ -189,8 +189,8 @@ fn main() {
     );
     let elapsed = now.elapsed();
     println!("Time taken (backward with Rayon): {:?}", elapsed);
-    println!("Output Tensor:");
-    println!("{:?}", &dout);
+    //println!("Output Tensor:");
+    //println!("{:?}", &dout);
 
 
 }

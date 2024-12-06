@@ -43,19 +43,19 @@ fn matmul_backward_blas(
     unsafe {
         sgemm(
             Layout::RowMajor,
-            Transpose::None, // No transpose for dout
-            Transpose::None, // No transpose for weight
+            Transpose::None,     // No transpose for dout
+            Transpose::None,     // No transpose for weight
             m,
             n,
             k,
             1.0,
             dout,
-            k,
+            k,                   // lda >= K (set to k)
             weight,
-            n,
+            n,                   // ldb >= N (set to n)
             0.0,
             dinp,
-            n,
+            n,                   // ldc >= N (set to n)
         );
     }
 
@@ -74,12 +74,12 @@ fn matmul_backward_blas(
             k_dw,
             1.0,
             dout,
-            k_dw,
+            m_dw,                // lda >= M (set to m_dw)
             inp,
-            n_dw,
+            n_dw,                // ldb >= N (set to n_dw)
             0.0,
             dweight,
-            n_dw,
+            n_dw,                // ldc >= N (set to n_dw)
         );
     }
 
@@ -94,6 +94,7 @@ fn matmul_backward_blas(
         }
     }
 }
+
 
 fn matmul_blas(
     out: &mut [f32],
@@ -203,7 +204,7 @@ fn main() {
     );
     let elapsed = now.elapsed();
     println!("Time taken: {:?}", elapsed);
-    println!("dout {:?}", &dout);
+    //println!("dout {:?}", &dout);
 
 
 }

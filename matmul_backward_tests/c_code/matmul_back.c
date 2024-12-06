@@ -69,7 +69,7 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
 }
 
 int main(int argc, char* argv[]) {
-    bool debug = true;
+    bool debug = false;
     if (argc != 5) {
         fprintf(stderr, "Usage: %s B T C OC\n", argv[0]);
         return 1;
