@@ -1304,12 +1304,10 @@ impl GPT2 {
  */
     }
     /* BACKWARD */
-    pub fn backward(& mut self) -> io::Result<()> {
-
+    pub fn backward(&mut self) -> io::Result<()> {
         if self.mean_loss == -1.0 {
             return Err(io::Error::new(io::ErrorKind::Other, "Error: must forward with targets before backward"));
         }
-
 
         let b = self.batch_size;
         let t = self.seq_len;
@@ -1323,9 +1321,11 @@ impl GPT2 {
             self.allocate_grad_activation_tensors(b, t, l, nh, c, v);
             self.zero_grad();
         }
-        let dloss_mean = 1.0/(b*t) as f32;
+
+        let dloss_mean = 1.0 / (b * t) as f32;
         self.grads_acts.losses.fill(dloss_mean);
 
+        // Backprop from loss
         crossentropy_softmax_backward(
             &mut self.grads_acts.logits,
             &mut self.grads_acts.losses,
@@ -1333,221 +1333,366 @@ impl GPT2 {
             &self.targets,
             b,
             t,
-            v);
+            v,
+        );
 
-        matmul_backward_blas(
-            &mut self.grads_acts.lnf,
-            &mut self.grads.wte,
-            None,
-            &mut self.grads_acts.logits,
-            &self.acts.lnf,
-            &self.params.wte,
-            b,
-            t,
-            c,
-            v);
+        // Backprop into lnf and wte
+        {
+            // For matmul_backward_blas, we need mut references to grads_acts.lnf and grads.wte.
+            // grads.wte is separate from grads_acts, so it's safe.
+            // grads_acts.logits is already mutable borrowed.
 
-        //line816
-        let residual_start = (l - 1) * b * t * c;
-        let residual_end = residual_start + b * t * c;
+            // We'll clone grads_acts.lnf and grads_acts.logits into locals.
+            let mut local_lnf = self.grads_acts.lnf.clone();
+            let mut local_logits = self.grads_acts.logits.clone();
 
-        let residual = &self.acts.residual3[residual_start..residual_end];
-        let mut dresidual = &mut self.grads_acts.residual3[residual_start..residual_end];
+            matmul_backward_blas(
+                &mut local_lnf,
+                &mut self.grads.wte,
+                None,
+                &mut local_logits,
+                &self.acts.lnf,
+                &self.params.wte,
+                b,
+                t,
+                c,
+                v,
+            );
 
-        layernorm_backward(&mut dresidual,
-            &mut self.grads.lnfw,
-            &mut self.grads.lnfb,
-            &mut self.grads_acts.lnf,
-            & residual,
-            &self.params.lnfw,
-            &self.acts.lnf_mean,
-            &self.acts.lnf_rstd,
-            b,
-            t,
-            c);
+            // Copy results back
+            self.grads_acts.lnf.copy_from_slice(&local_lnf);
+            self.grads_acts.logits.copy_from_slice(&local_logits);
+        }
 
-        // Convenience references
-        let params = &self.params;
-        let grads = &mut self.grads;
-        let acts = &self.acts;
-        let grads_acts = &mut self.grads_acts;
+        // Backprop through final layernorm
+        {
+            let residual_start = (l - 1) * b * t * c;
+            let residual_end = residual_start + b * t * c;
 
+            // layernorm_backward modifies dresidual, dweight, dbias, dout
+            // dresidual = grads_acts.residual3 slice
+            // dout = grads_acts.lnf slice
+            // dweight, dbias = grads.lnfw, grads.lnfb (no overlap)
+            // inp = acts.residual3 (read-only), weight = params.lnfw (read-only)
+
+            let residual = &self.acts.residual3[residual_start..residual_end];
+
+            // Clone the slices we need to mutate
+            let mut local_dresidual = self.grads_acts.residual3[residual_start..residual_end].to_vec();
+            let mut local_dlnf = self.grads_acts.lnf.to_vec(); // because it's also modified as dout
+
+            layernorm_backward(
+                &mut local_dresidual,
+                &mut self.grads.lnfw,
+                &mut self.grads.lnfb,
+                &mut local_dlnf,
+                residual,
+                &self.params.lnfw,
+                &self.acts.lnf_mean,
+                &self.acts.lnf_rstd,
+                b,
+                t,
+                c,
+            );
+
+            // Copy updated values back
+            self.grads_acts.residual3[residual_start..residual_end].copy_from_slice(&local_dresidual);
+            self.grads_acts.lnf.copy_from_slice(&local_dlnf);
+        }
+
+        // Now handle each layer in reverse order
         for layer_idx in (0..l).rev() {
-
-            let (residual, dresidual) = if layer_idx == 0 {
-                (&acts.encoded[..], &mut grads_acts.encoded[..])
+            let (residual_slice, dresidual_slice_range) = if layer_idx == 0 {
+                // first layer: residual is acts.encoded
+                (self.acts.encoded.as_slice(), 0..b*t*c)
             } else {
                 let start = (layer_idx - 1) * b * t * c;
                 let end = start + b * t * c;
-                (&acts.residual3[start..end], &mut grads_acts.residual3[start..end])
+                (&self.acts.residual3[start..end], start..end)
             };
-
-            let l_ln1w = &params.ln1w[layer_idx * c .. (layer_idx + 1) * c];
-            let l_qkvw = &params.qkvw[layer_idx * 3 * c * c .. (layer_idx + 1) * 3 * c * c];
-            let l_attprojw = &params.attprojw[layer_idx * c * c .. (layer_idx + 1) * c * c];
-            let l_ln2w = &params.ln2w[layer_idx * c .. (layer_idx + 1) * c];
-            let l_fcw = &params.fcw[layer_idx * 4 * c * c .. (layer_idx + 1) * 4 * c * c];
-            let l_fcprojw = &params.fcprojw[layer_idx * c * 4 * c .. (layer_idx + 1) * c * 4 * c];
-
-            let dl_ln1w = &mut grads.ln1w[layer_idx * c .. (layer_idx + 1) * c];
-            let dl_ln1b = &mut grads.ln1b[layer_idx * c .. (layer_idx + 1) * c];
-            let dl_qkvw = &mut grads.qkvw[layer_idx * 3 * c * c .. (layer_idx + 1) * 3 * c * c];
-            let dl_qkvb = &mut grads.qkvb[layer_idx * 3 * c .. (layer_idx + 1) * 3 * c];
-            let dl_attprojw = &mut grads.attprojw[layer_idx * c * c .. (layer_idx + 1) * c * c];
-            let dl_attprojb = &mut grads.attprojb[layer_idx * c .. (layer_idx + 1) * c];
-            let dl_ln2w = &mut grads.ln2w[layer_idx * c .. (layer_idx + 1) * c];
-            let dl_ln2b = &mut grads.ln2b[layer_idx * c .. (layer_idx + 1) * c];
-            let dl_fcw = &mut grads.fcw[layer_idx * 4 * c * c .. (layer_idx + 1) * 4 * c * c];
-            let dl_fcb = &mut grads.fcb[layer_idx * 4 * c .. (layer_idx + 1) * 4 * c];
-            let dl_fcprojw = &mut grads.fcprojw[layer_idx * c * 4 * c .. (layer_idx + 1) * c * 4 * c];
-            let dl_fcprojb = &mut grads.fcprojb[layer_idx * c .. (layer_idx + 1) * c];
 
             let start_bt_c = layer_idx * b * t * c;
             let end_bt_c = start_bt_c + b * t * c;
-            let l_ln1 = &acts.ln1[start_bt_c..end_bt_c];
-            let l_ln1_mean = &acts.ln1_mean[layer_idx * b * t .. layer_idx * b * t + b * t];
-            let l_ln1_rstd = &acts.ln1_rstd[layer_idx * b * t .. layer_idx * b * t + b * t];
-            let l_qkv = &acts.qkv[layer_idx * b * t * 3*c .. (layer_idx+1)*b * t * 3*c];
-            let l_atty = &acts.atty[start_bt_c..end_bt_c];
-            let l_att = &acts.att[layer_idx * b * nh * t * t .. (layer_idx+1)*b * nh * t * t];
-            let l_residual2 = &acts.residual2[start_bt_c..end_bt_c];
-            let l_ln2 = &acts.ln2[start_bt_c..end_bt_c];
-            let l_ln2_mean = &acts.ln2_mean[layer_idx * b * t .. layer_idx * b * t + b * t];
-            let l_ln2_rstd = &acts.ln2_rstd[layer_idx * b * t .. layer_idx * b * t + b * t];
-            let l_fch = &acts.fch[layer_idx * b * t * 4*c .. (layer_idx+1)*b * t * 4*c];
-            let l_fch_gelu = &acts.fch_gelu[layer_idx * b * t * 4*c .. (layer_idx+1)*b * t * 4*c];
 
+            // residual_backward on residual3
             {
-                // Borrow each of these as needed in separate blocks:
-                let dl_ln1 = &mut grads_acts.ln1[start_bt_c..end_bt_c];
-                let dl_qkv = &mut grads_acts.qkv[layer_idx * b * t * 3*c .. (layer_idx+1)*b * t * 3*c];
-                let dl_atty = &mut grads_acts.atty[start_bt_c..end_bt_c];
-                let dl_preatt = &mut grads_acts.preatt[layer_idx * b * nh * t * t .. (layer_idx+1)*b * nh * t * t];
-                let dl_att = &mut grads_acts.att[layer_idx * b * nh * t * t .. (layer_idx+1)*b * nh * t * t];
-                let dl_attproj = &mut grads_acts.attproj[start_bt_c..end_bt_c];
-                let dl_residual2 = &mut grads_acts.residual2[start_bt_c..end_bt_c];
-                let dl_ln2 = &mut grads_acts.ln2[start_bt_c..end_bt_c];
-                let dl_fch = &mut grads_acts.fch[layer_idx * b * t * 4*c .. (layer_idx+1)*b * t * 4*c];
-                let dl_fch_gelu = &mut grads_acts.fch_gelu[layer_idx * b * t * 4*c .. (layer_idx+1)*b * t * 4*c];
-                let dl_fcproj = &mut grads_acts.fcproj[start_bt_c..end_bt_c];
+                // We need dl_residual2, dl_fcproj, dl_residual3 from grads_acts overlapping
+                let mut local_residual2 = self.grads_acts.residual2[start_bt_c..end_bt_c].to_vec();
+                let mut local_fcproj = self.grads_acts.fcproj[start_bt_c..end_bt_c].to_vec();
+                let mut local_residual3 = self.grads_acts.residual3[start_bt_c..end_bt_c].to_vec();
 
-                let dl_residual3 = &mut grads_acts.residual3[start_bt_c..end_bt_c];
-                residual_backward(dl_residual2, dl_fcproj, dl_residual3, b*t*c);
+                residual_backward(&mut local_residual2, &mut local_fcproj, &mut local_residual3, b*t*c);
 
+                // Copy back
+                self.grads_acts.residual2[start_bt_c..end_bt_c].copy_from_slice(&local_residual2);
+                self.grads_acts.fcproj[start_bt_c..end_bt_c].copy_from_slice(&local_fcproj);
+                self.grads_acts.residual3[start_bt_c..end_bt_c].copy_from_slice(&local_residual3);
+            }
 
-                // Now dl_residual3 is out of scope, we can safely borrow dl_fcproj or others again if needed
-                matmul_backward_blas(
-                    dl_fch_gelu,
-                    dl_fcprojw,
-                    Some(dl_fcprojb),
-                    dl_fcproj,
-                    l_fch_gelu,
-                    l_fcprojw,
-                    b,
-                    t,
-                    4*c,
-                    c
-                );
-                gelu_backward(dl_fch, l_fch, dl_fch_gelu, b*t*4*c);
-                matmul_backward_blas(
-                    dl_ln2,
-                    dl_fcw,
-                    Some(dl_fcb),
-                    dl_fch,
-                    l_ln2,
-                    l_fcw,
-                    b,
-                    t,
-                    c,
-                    4*c
-                );
+            // fcproj backward + gelu backward + fcw backward
+            {
+                let fch_range = layer_idx * b * t * 4 * c .. (layer_idx + 1)* b * t * 4 * c;
+
+                let mut local_fcproj = self.grads_acts.fcproj[start_bt_c..end_bt_c].to_vec();
+                let mut local_fch = self.grads_acts.fch[fch_range.clone()].to_vec();
+                let mut local_fch_gelu = self.grads_acts.fch_gelu[fch_range.clone()].to_vec();
+                let mut local_ln2 = self.grads_acts.ln2[start_bt_c..end_bt_c].to_vec();
+
+                let l_fch_gelu = &self.acts.fch_gelu[fch_range.clone()];
+                let l_ln2 = &self.acts.ln2[start_bt_c..end_bt_c];
+                let l_fcprojw = &self.params.fcprojw[layer_idx * c * 4 * c..(layer_idx + 1)*c*4*c];
+                let l_fcw = &self.params.fcw[layer_idx * 4 * c * c..(layer_idx + 1)*4*c*c];
+
+                // fcproj backward
+                {
+                    let mut local_fcprojw = self.grads.fcprojw[layer_idx * c * 4 * c..(layer_idx + 1)*c*4*c].to_vec();
+                    let mut local_fcprojb = self.grads.fcprojb[layer_idx * c..(layer_idx + 1)*c].to_vec();
+
+                    matmul_backward_blas(
+                        &mut local_fch_gelu,
+                        &mut local_fcprojw,
+                        Some(&mut local_fcprojb),
+                        &mut local_fcproj,
+                        l_fch_gelu,
+                        l_fcprojw,
+                        b, t, 4*c, c
+                    );
+
+                    // copy fcprojw, fcprojb back
+                    self.grads.fcprojw[layer_idx * c * 4 * c..(layer_idx + 1)*c*4*c].copy_from_slice(&local_fcprojw);
+                    self.grads.fcprojb[layer_idx * c..(layer_idx + 1)*c].copy_from_slice(&local_fcprojb);
+                }
+
+                // gelu backward
+                {
+                    let l_fch = &self.acts.fch[fch_range.clone()];
+                    gelu_backward(&mut local_fch, l_fch, &mut local_fch_gelu, b*t*4*c);
+                }
+
+                // fcw backward
+                {
+                    let mut local_fcw = self.grads.fcw[layer_idx * 4 * c * c..(layer_idx+1)*4*c*c].to_vec();
+                    let mut local_fcb = self.grads.fcb[layer_idx * 4 * c..(layer_idx + 1)*4*c].to_vec();
+
+                    matmul_backward_blas(
+                        &mut local_ln2,
+                        &mut local_fcw,
+                        Some(&mut local_fcb),
+                        &mut local_fch,
+                        l_ln2,
+                        l_fcw,
+                        b, t, c, 4*c
+                    );
+
+                    // copy fcw,fcb back
+                    self.grads.fcw[layer_idx * 4 * c * c..(layer_idx+1)*4*c*c].copy_from_slice(&local_fcw);
+                    self.grads.fcb[layer_idx * 4 * c..(layer_idx + 1)*4*c].copy_from_slice(&local_fcb);
+                }
+
+                // copy fcproj, fch, fch_gelu, ln2 back
+                self.grads_acts.fcproj[start_bt_c..end_bt_c].copy_from_slice(&local_fcproj);
+                self.grads_acts.fch[fch_range.clone()].copy_from_slice(&local_fch);
+                self.grads_acts.fch_gelu[fch_range.clone()].copy_from_slice(&local_fch_gelu);
+                self.grads_acts.ln2[start_bt_c..end_bt_c].copy_from_slice(&local_ln2);
+            }
+
+            // ln2 backward
+            {
+                // Similar pattern: clone what ln2 backward modifies
+                let mut local_ln2 = self.grads_acts.ln2[start_bt_c..end_bt_c].to_vec();
+                let mut local_residual2 = self.grads_acts.residual2[start_bt_c..end_bt_c].to_vec();
+
+                let l_ln2w = &self.params.ln2w[layer_idx * c..(layer_idx + 1)*c];
+                let mut local_ln2w = self.grads.ln2w[layer_idx * c..(layer_idx + 1)*c].to_vec();
+                let mut local_ln2b = self.grads.ln2b[layer_idx * c..(layer_idx + 1)*c].to_vec();
+                let l_residual2 = &self.acts.residual2[start_bt_c..end_bt_c];
+
                 layernorm_backward(
-                    dl_residual2,
-                    dl_ln2w,
-                    dl_ln2b,
-                    dl_ln2,
+                    &mut local_residual2,
+                    &mut local_ln2w,
+                    &mut local_ln2b,
+                    &mut local_ln2,
                     l_residual2,
                     l_ln2w,
-                    l_ln2_mean,
-                    l_ln2_rstd,
-                    b,
-                    t,
-                    c
+                    &self.acts.ln2_mean[layer_idx*b*t..(layer_idx*b*t+b*t)],
+                    &self.acts.ln2_rstd[layer_idx*b*t..(layer_idx*b*t+b*t)],
+                    b, t, c
                 );
 
+                // copy back
+                self.grads_acts.ln2[start_bt_c..end_bt_c].copy_from_slice(&local_ln2);
+                self.grads_acts.residual2[start_bt_c..end_bt_c].copy_from_slice(&local_residual2);
+                self.grads.ln2w[layer_idx * c..(layer_idx + 1)*c].copy_from_slice(&local_ln2w);
+                self.grads.ln2b[layer_idx * c..(layer_idx + 1)*c].copy_from_slice(&local_ln2b);
+            }
 
-                // Another scope for dl_attproj, dl_residual2, and dresidual
-                // Make sure dl_attproj has not been borrowed previously in this loop iteration
-                let dl_residual2 = &mut grads_acts.residual2[start_bt_c..end_bt_c];
-                let dl_attproj = &mut grads_acts.attproj[start_bt_c..end_bt_c];
+            // residual backward for residual2, attproj
+            {
+                let mut local_attproj = self.grads_acts.attproj[start_bt_c..end_bt_c].to_vec();
+                let mut local_residual2 = self.grads_acts.residual2[start_bt_c..end_bt_c].to_vec();
+                let dresidual_slice_start = dresidual_slice_range.start;
+                let dresidual_slice_end = dresidual_slice_range.end;
+                let mut local_dresidual = self.grads_acts.encoded[dresidual_slice_start..dresidual_slice_end].to_vec();
+                // If layer_idx > 0, this should be residual3 slice instead of encoded. Adjust accordingly:
+                if layer_idx > 0 {
+                    local_dresidual = self.grads_acts.residual3[dresidual_slice_start..dresidual_slice_end].to_vec();
+                }
 
-                residual_backward(dresidual, dl_attproj, dl_residual2, b*t*c);
+                residual_backward(&mut local_dresidual, &mut local_attproj, &mut local_residual2, b*t*c);
 
+                // copy back
+                if layer_idx == 0 {
+                    self.grads_acts.encoded[dresidual_slice_start..dresidual_slice_end].copy_from_slice(&local_dresidual);
+                } else {
+                    self.grads_acts.residual3[dresidual_slice_start..dresidual_slice_end].copy_from_slice(&local_dresidual);
+                }
+                self.grads_acts.attproj[start_bt_c..end_bt_c].copy_from_slice(&local_attproj);
+                self.grads_acts.residual2[start_bt_c..end_bt_c].copy_from_slice(&local_residual2);
+            }
+
+            // attproj backward
+            {
+                let mut local_attproj = self.grads_acts.attproj[start_bt_c..end_bt_c].to_vec();
+                let mut local_atty = self.grads_acts.atty[start_bt_c..end_bt_c].to_vec();
+
+                let l_attprojw = &self.params.attprojw[layer_idx * c * c..(layer_idx + 1)*c*c];
+                let mut local_attprojw = self.grads.attprojw[layer_idx * c * c..(layer_idx + 1)*c*c].to_vec();
+                let mut local_attprojb = self.grads.attprojb[layer_idx * c..(layer_idx + 1)*c].to_vec();
+                let l_atty = &self.acts.atty[start_bt_c..end_bt_c];
 
                 matmul_backward_blas(
-                    dl_atty,
-                    dl_attprojw,
-                    Some(dl_attprojb),
-                    dl_attproj,
+                    &mut local_atty,
+                    &mut local_attprojw,
+                    Some(&mut local_attprojb),
+                    &mut local_attproj,
                     l_atty,
                     l_attprojw,
-                    b,
-                    t,
-                    c,
-                    c
+                    b, t, c, c
                 );
+
+                self.grads_acts.attproj[start_bt_c..end_bt_c].copy_from_slice(&local_attproj);
+                self.grads_acts.atty[start_bt_c..end_bt_c].copy_from_slice(&local_atty);
+                self.grads.attprojw[layer_idx * c * c..(layer_idx+1)*c*c].copy_from_slice(&local_attprojw);
+                self.grads.attprojb[layer_idx * c..(layer_idx+1)*c].copy_from_slice(&local_attprojb);
+            }
+
+            // attention backward
+            {
+                let qkv_range = layer_idx * b * t * 3 * c .. (layer_idx+1)*b*t*3*c;
+                let att_range = layer_idx * b * nh * t * t .. (layer_idx+1)*b*nh*t*t;
+
+                let mut local_qkv = self.grads_acts.qkv[qkv_range.clone()].to_vec();
+                let mut local_preatt = self.grads_acts.preatt[att_range.clone()].to_vec();
+                let mut local_att = self.grads_acts.att[att_range.clone()].to_vec();
+                let mut local_atty = self.grads_acts.atty[start_bt_c..end_bt_c].to_vec();
+
+                let l_qkv = &self.acts.qkv[qkv_range.clone()];
+                let l_att = &self.acts.att[att_range.clone()];
+
                 attention_backward(
-                    dl_qkv,
-                    dl_preatt,
-                    dl_att,
-                    dl_atty,
+                    &mut local_qkv,
+                    &mut local_preatt,
+                    &mut local_att,
+                    &mut local_atty,
                     l_qkv,
                     l_att,
-                    b,
-                    t,
-                    c,
-                    nh
+                    b, t, c, nh
                 );
+
+                self.grads_acts.qkv[qkv_range.clone()].copy_from_slice(&local_qkv);
+                self.grads_acts.preatt[att_range.clone()].copy_from_slice(&local_preatt);
+                self.grads_acts.att[att_range.clone()].copy_from_slice(&local_att);
+                self.grads_acts.atty[start_bt_c..end_bt_c].copy_from_slice(&local_atty);
+            }
+
+            // qkv backward
+            {
+                let qkv_range = layer_idx * b * t * 3 * c .. (layer_idx+1)*b*t*3*c;
+
+                let mut local_ln1 = self.grads_acts.ln1[start_bt_c..end_bt_c].to_vec();
+                let mut local_qkv = self.grads_acts.qkv[qkv_range.clone()].to_vec();
+
+                let l_ln1 = &self.acts.ln1[start_bt_c..end_bt_c];
+                let l_qkvw = &self.params.qkvw[layer_idx*3*c*c..(layer_idx+1)*3*c*c];
+                let mut local_qkvw = self.grads.qkvw[layer_idx*3*c*c..(layer_idx+1)*3*c*c].to_vec();
+                let mut local_qkvb = self.grads.qkvb[layer_idx*3*c..(layer_idx+1)*3*c].to_vec();
+
                 matmul_backward_blas(
-                    dl_ln1,
-                    dl_qkvw,
-                    Some(dl_qkvb),
-                    dl_qkv,
+                    &mut local_ln1,
+                    &mut local_qkvw,
+                    Some(&mut local_qkvb),
+                    &mut local_qkv,
                     l_ln1,
                     l_qkvw,
-                    b,
-                    t,
-                    c,
-                    3*c
+                    b, t, c, 3*c
                 );
+
+                // Copy back
+                self.grads_acts.ln1[start_bt_c..end_bt_c].copy_from_slice(&local_ln1);
+                self.grads_acts.qkv[qkv_range].copy_from_slice(&local_qkv);
+                self.grads.qkvw[layer_idx*3*c*c..(layer_idx+1)*3*c*c].copy_from_slice(&local_qkvw);
+                self.grads.qkvb[layer_idx*3*c..(layer_idx+1)*3*c].copy_from_slice(&local_qkvb);
+            }
+
+            // ln1 backward
+            {
+                let mut local_dresidual = if layer_idx == 0 {
+                    self.grads_acts.encoded[dresidual_slice_range.clone()].to_vec()
+                } else {
+                    self.grads_acts.residual3[dresidual_slice_range.clone()].to_vec()
+                };
+
+                let mut local_ln1 = self.grads_acts.ln1[start_bt_c..end_bt_c].to_vec();
+
+                let l_ln1w = &self.params.ln1w[layer_idx*c..(layer_idx+1)*c];
+                let mut local_ln1w = self.grads.ln1w[layer_idx*c..(layer_idx+1)*c].to_vec();
+                let mut local_ln1b = self.grads.ln1b[layer_idx*c..(layer_idx+1)*c].to_vec();
+
                 layernorm_backward(
-                    dresidual,
-                    dl_ln1w,
-                    dl_ln1b,
-                    dl_ln1,
-                    residual,
+                    &mut local_dresidual,
+                    &mut local_ln1w,
+                    &mut local_ln1b,
+                    &mut local_ln1,
+                    residual_slice,
                     l_ln1w,
-                    l_ln1_mean,
-                    l_ln1_rstd,
-                    b,
-                    t,
-                    c
+                    &self.acts.ln1_mean[layer_idx*b*t..(layer_idx*b*t+b*t)],
+                    &self.acts.ln1_rstd[layer_idx*b*t..(layer_idx*b*t+b*t)],
+                    b,t,c
                 );
-            } // all dl_* borrows end here
+
+                // copy back
+                if layer_idx == 0 {
+                    self.grads_acts.encoded[dresidual_slice_range.clone()].copy_from_slice(&local_dresidual);
+                } else {
+                    self.grads_acts.residual3[dresidual_slice_range.clone()].copy_from_slice(&local_dresidual);
+                }
+                self.grads_acts.ln1[start_bt_c..end_bt_c].copy_from_slice(&local_ln1);
+                self.grads.ln1w[layer_idx*c..(layer_idx+1)*c].copy_from_slice(&local_ln1w);
+                self.grads.ln1b[layer_idx*c..(layer_idx+1)*c].copy_from_slice(&local_ln1b);
+            }
+
         }
 
-        encoder_backward(
-            &mut self.grads.wte,
-            &mut self.grads.wpe,
-            &mut self.grads_acts.encoded,
-            &self.inputs,
-            b,
-            t,
-            c
-        );
+        // Finally, backprop into encoder embeddings
+        {
+            let local_encoded = self.grads_acts.encoded.clone();
+            // wte, wpe are from self.grads, no overlap. Just call normally:
+            encoder_backward(
+                &mut self.grads.wte,
+                &mut self.grads.wpe,
+                &local_encoded,
+                &self.inputs,
+                b,
+                t,
+                c,
+            );
+            // If encoder_backward modifies encoded grads in place, copy back as needed.
+            self.grads_acts.encoded.copy_from_slice(&local_encoded);
+        }
 
         Ok(())
     }
+
 
     pub fn update(&mut self, learning_rate: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32, t: usize) {
         // Lazily allocate m_memory and v_memory if they are empty
