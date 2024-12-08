@@ -1,3 +1,4 @@
+use std::intrinsics::sqrtf32;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::fs::File;
 use std::path::Path;
@@ -107,14 +108,15 @@ fn layernorm_backward(
 ) {
     for b_idx in 0..b {
         for t_idx in 0..t {
-            let start_idx = b_idx * t * c + t_idx * c;
-            let dout_bt = &dout[start_idx..start_idx + c];
-            let inp_bt = &inp[start_idx..start_idx + c];
-            let dinp_bt = &mut dinp[start_idx..start_idx + c];
             let mean_bt = mean[b_idx * t + t_idx];
             let rstd_bt = rstd[b_idx * t + t_idx];
 
-            // First: two reduce operations
+            let base = b_idx * t * c + t_idx * c;
+            let dout_bt = &dout[base..base + c];
+            let inp_bt = &inp[base..base + c];
+            let dinp_bt = &mut dinp[base..base + c];
+
+            // first pass: two reduce operations
             let mut dnorm_mean = 0.0f32;
             let mut dnorm_norm_mean = 0.0f32;
 
@@ -124,23 +126,26 @@ fn layernorm_backward(
                 dnorm_mean += dnorm_i;
                 dnorm_norm_mean += dnorm_i * norm_bti;
             }
-
             dnorm_mean /= c as f32;
             dnorm_norm_mean /= c as f32;
 
-            // Now iterate again and accumulate all the gradients
+            // second pass: accumulate all gradients
             for i in 0..c {
                 let norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
                 let dnorm_i = weight[i] * dout_bt[i];
-                // Gradient contribution to bias
+
+                // gradient contribution to bias
                 dbias[i] += dout_bt[i];
-                // Gradient contribution to weight
+
+                // gradient contribution to weight
                 dweight[i] += norm_bti * dout_bt[i];
-                // Gradient contribution to input
-                let mut dval = dnorm_i; // Term 1
-                dval -= dnorm_mean; // Term 2
-                dval -= norm_bti * dnorm_norm_mean; // Term 3
-                dval *= rstd_bt; // Final scale
+
+                // gradient contribution to input
+                let mut dval = dnorm_i;          // term 1
+                dval -= dnorm_mean;              // term 2
+                dval -= norm_bti * dnorm_norm_mean; // term 3
+                dval *= rstd_bt;                 // final scale
+
                 dinp_bt[i] += dval;
             }
         }
@@ -475,12 +480,33 @@ fn residual_forward(out: &mut [f32], inp1: &[f32], inp2: &[f32], n: usize) {
     */
 }
 
+fn residual_backward(dinp1: &mut [f32], dinp2: &mut [f32], dout: &mut [f32], n: usize){
+    for i in 0..n {
+        dinp1[i] = dout[i];
+        dinp2[i] = dout[i];
+    }
+}
+
 fn gelu_forward(out: &mut [f32], inp: &[f32], n: usize) {
     let s = (2.0 / std::f32::consts::PI).sqrt();
     for i in 0..n {
         let x = inp[i];
         let cube: f32 = 0.044715 * x * x * x;
         out[i] = 0.5 * x * (1.0 + (s * (x + cube)).tanh());
+    }
+}
+
+fn gelu_backward(dinp: &mut [f32], inp: &[f32], dout: &mut [f32], n: usize) {
+    let s = (2.0 / std::f32::consts::PI).sqrt();
+    for i in 0..n {
+        let x = inp[i];
+        let cube: f32 = 0.044715 * x * x * x;
+        let tanh_arg = s * (x + cube);
+        let tanh_out = (tanh_arg).tanh();
+        let coshf_out = (tanh_arg).cosh();
+        let sech_out = 1.0 / (coshf_out*coshf_out);
+        let local_grad = 0.5  * ( 1.0 + tanh_out) + x * 0.5 * sech_out * s * (1.0 + 3.0 + 0.044715*x*x);
+        dinp[i] += local_grad + dout[i];
     }
 }
 
@@ -978,7 +1004,7 @@ impl GPT2 {
             let l_residual3 = &mut self.acts.residual3[index_base..next_index_base];
 
             // FORWARD PASS
-            //println!("Executing layernorm foward pass");
+            // println!("Executing layernorm foward pass");
             layernorm_forward(
                  l_ln1,
                  l_ln1_mean,
@@ -990,8 +1016,8 @@ impl GPT2 {
                 self.seq_len,
                 self.config.channels
             );
-            //println!("Executing matmul forward pass");
-            //let start = Instant::now();
+            // println!("Executing matmul forward pass");
+            // let start = Instant::now();
             matmul_forward(
                 l_qkv,
                 l_ln1,      // Input
@@ -1002,9 +1028,9 @@ impl GPT2 {
                 c,
                 3*c
             );
-            //let duration = start.elapsed();
-            //println!("Function took: {:?}", duration);
-            //println!("Executing attention forward pass");
+            // let duration = start.elapsed();
+            // println!("Function took: {:?}", duration);
+            // println!("Executing attention forward pass");
             attention_forward(
                 l_atty,
                 l_preatt,
@@ -1014,8 +1040,8 @@ impl GPT2 {
                 t,
                 c,
                 nh);
-            //println!("Executing matmul forward pass");
-            //let start = Instant::now();
+            // println!("Executing matmul forward pass");
+            // let start = Instant::now();
             matmul_forward(
                 l_attproj,
                 l_atty,
@@ -1025,15 +1051,15 @@ impl GPT2 {
                 t,
                 c,
                 c);
-            //let duration = start.elapsed();
-            //println!("Function took: {:?}", duration);
-            //println!("Executing residual forward pass");
+            // let duration = start.elapsed();
+            // println!("Function took: {:?}", duration);
+            // println!("Executing residual forward pass");
             residual_forward(
                 l_residual2,
                 &residual,
                 l_attproj,
                 b*t*c);
-            //println!("Executing layernorm forward pass");
+            // println!("Executing layernorm forward pass");
             layernorm_forward(
                 l_ln2,
                 l_ln2_mean,
@@ -1044,8 +1070,8 @@ impl GPT2 {
                 b,
                 t,
                 c);
-            //println!("Executing matmul forward pass");
-            //let start = Instant::now();
+            // println!("Executing matmul forward pass");
+            // let start = Instant::now();
             matmul_forward(
                 l_fch,
                 l_ln2,
@@ -1055,15 +1081,15 @@ impl GPT2 {
                 t,
                 4*c,
                 c);
-            //let duration = start.elapsed();
-            //println!("Function took: {:?}", duration);
-            //println!("Executing gelu forward pass");
+            // let duration = start.elapsed();
+            // println!("Function took: {:?}", duration);
+            // println!("Executing gelu forward pass");
             gelu_forward(
                 l_fch_gelu,
                 l_fch,
                 b*t*4*c);
-            //println!("Executing matmul forward pass");
-            //let start = Instant::now();
+            // println!("Executing matmul forward pass");
+            // let start = Instant::now();
             matmul_forward(
                 l_fcproj,
                 l_fch_gelu,
@@ -1073,9 +1099,9 @@ impl GPT2 {
                 t,
                 4*c,
                 c);
-            //let duration = start.elapsed();
-            //println!("Function took: {:?}", duration);
-            //println!("Executing residual forward pass");
+            // let duration = start.elapsed();
+            // println!("Function took: {:?}", duration);
+            // println!("Executing residual forward pass");
             residual_forward(
                 l_residual3,
                 l_ln2,
@@ -1094,7 +1120,7 @@ impl GPT2 {
             b,
             t,
             c);
-        //let start = Instant::now();
+        // let start = Instant::now();
         matmul_forward(&mut self.acts.logits,
             &mut self.acts.lnf,
             & self.params.wte,
@@ -1103,8 +1129,8 @@ impl GPT2 {
             t,
             c,
             v);
-        //let duration = start.elapsed();
-        //println!("Function took: {:?}", duration);
+        // let duration = start.elapsed();
+        // println!("Function took: {:?}", duration);
         softmax_forward(&mut self.acts.probs,
             &self.acts.logits,
             b,
@@ -1213,7 +1239,7 @@ impl GPT2 {
             t,
             v);
 
-        matmul_backward(
+        matmul_backward_blas(
             &mut self.grads_acts.lnf,
             &mut self.grads.wte,
             None,
@@ -1243,6 +1269,8 @@ impl GPT2 {
             b,
             t,
             c);
+
+
 
         Ok(())
     }
@@ -1400,6 +1428,25 @@ fn gpt2_build_from_checkpoint(model: &mut GPT2, checkpoint_path: &Path) -> io::R
     model.seq_len = 0;
     model.mean_loss = -1.0; // Indicate no loss calculated yet
 
+    // Allocate grads to the same sizes
+    model.grads.wte.resize(model.params.wte.len(), 0.0);
+    model.grads.wpe.resize(model.params.wpe.len(), 0.0);
+    model.grads.ln1w.resize(model.params.ln1w.len(), 0.0);
+    model.grads.ln1b.resize(model.params.ln1b.len(), 0.0);
+    model.grads.qkvw.resize(model.params.qkvw.len(), 0.0);
+    model.grads.qkvb.resize(model.params.qkvb.len(), 0.0);
+    model.grads.attprojw.resize(model.params.attprojw.len(), 0.0);
+    model.grads.attprojb.resize(model.params.attprojb.len(), 0.0);
+    model.grads.ln2w.resize(model.params.ln2w.len(), 0.0);
+    model.grads.ln2b.resize(model.params.ln2b.len(), 0.0);
+    model.grads.fcw.resize(model.params.fcw.len(), 0.0);
+    model.grads.fcb.resize(model.params.fcb.len(), 0.0);
+    model.grads.fcprojw.resize(model.params.fcprojw.len(), 0.0);
+    model.grads.fcprojb.resize(model.params.fcprojb.len(), 0.0);
+    model.grads.lnfw.resize(model.params.lnfw.len(), 0.0);
+    model.grads.lnfb.resize(model.params.lnfb.len(), 0.0);
+
+
     Ok(())
 }
 
@@ -1468,11 +1515,11 @@ fn main() {
             model.forward(&train_loader.inputs, Some(&train_loader.targets), B, T);
             println!("train loss: {}", model.mean_loss);
             println!("Backward");
-            // model.backward();
-            // let grad_mean: f32 = model.grads_memory.iter().sum::<f32>() / model.grads_memory.len() as f32;
-            // println!("Gradient mean: {}", grad_mean);
-            // println!("Update");
-            // model.update(1e-4, 0.9, 0.999, 1e-8, 0.0, step+1);
+            model.backward();
+            let grad_mean: f32 = model.grads_memory.iter().sum::<f32>() / model.grads_memory.len() as f32;
+            println!("Gradient mean: {}", grad_mean);
+            println!("Update");
+            model.update(1e-4, 0.9, 0.999, 1e-8, 0.0, step+1);
         }
         println!("validation");
         // if step % 10 == 0 {
