@@ -1,4 +1,3 @@
-use std::intrinsics::sqrtf32;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::fs::File;
 use std::path::Path;
@@ -40,6 +39,24 @@ fn encoder_forward(out: &mut [f32], inp: &[i32], wte: &[f32], wpe: &[f32], b: us
             // Add the two vectors and store the result in out[b, t, :]
             for i in 0..c {
                 out_bt[i] = wte_ix[i] + wpe_t[i];
+            }
+        }
+    }
+}
+
+fn encoder_backward(dwte: &mut [f32], dwpe: &mut [f32], dout: &[f32], inp: &[i32], b: usize, t: usize, c: usize) {
+    for b_idx in 0..b {
+        for t_idx in 0..t {
+            let out_start_idx = b_idx * t * c + t_idx * c;
+            let out_bt = &dout[out_start_idx..out_start_idx + c];
+            let ix = inp[b_idx * t + t_idx] as usize;
+            let dwte_start_idx = ix * c;
+            let dwte_ix = &mut dwte[dwte_start_idx..dwte_start_idx + c];
+            let dwpe_start_idx = t_idx * c;
+            let dwpe_t = &mut dwpe[dwpe_start_idx..dwpe_start_idx + c];
+            for i in 0..c {
+                dwte_ix[i] += out_bt[i];
+                dwpe_t[i] += out_bt[i];
             }
         }
     }
@@ -457,6 +474,85 @@ fn attention_forward(
                 }
 
                 out[out_start..out_start + hs].copy_from_slice(&out_vec);
+            }
+        }
+    }
+}
+
+fn attention_backward(
+    dinp: &mut [f32],
+    dpreatt: &mut [f32],
+    datt: &mut [f32],
+    dout: &[f32],
+    inp: &[f32],
+    att: &[f32],
+    b: usize,
+    t: usize,
+    c: usize,
+    nh: usize,
+) {
+    let c3 = c * 3;
+    let hs = c / nh;
+    let scale = 1.0 / (hs as f32).sqrt();
+
+    dpreatt.fill(0.0);
+    datt.fill(0.0);
+    // If needed, zero out dinp as well:
+    // dinp.fill(0.0);
+
+    for b_idx in 0..b {
+        for t_idx in 0..t {
+            for h in 0..nh {
+                // Index computations
+                let att_start = b_idx * nh * t * t + h * t * t + t_idx * t;
+                let preatt_start = att_start;
+                let query_start = b_idx * t * c3 + t_idx * c3 + h * hs;
+                let valid_len = t_idx + 1;
+
+                let att_bth = &att[att_start..att_start + t];
+                let datt_bth = &mut datt[att_start..att_start + t];
+                let dpreatt_bth = &mut dpreatt[preatt_start..preatt_start + t];
+
+                let dout_offset = b_idx * t * c + t_idx * c + h * hs;
+                // dout_bth: reference to output gradient for this head/time
+                let dout_bth = &dout[dout_offset .. dout_offset + hs];
+
+                // STEP 1: Backprop through value accumulation
+                // forward: out_bth[i] += att_bth[t2] * value_t2[i]
+                // backward:
+                // datt_bth[t2] += value_t2[i] * dout_bth[i]
+                // dvalue_t2[i] += att_bth[t2] * dout_bth[i]
+                for t2 in 0..valid_len {
+                    let value_t2_start = b_idx * t * c3 + t2 * c3 + h * hs + c * 2; // +C*2 for value
+                    for i in 0..hs {
+                        datt_bth[t2] += inp[value_t2_start + i] * dout_bth[i];
+                        dinp[value_t2_start + i] += att_bth[t2] * dout_bth[i];
+                    }
+                }
+
+                // STEP 2: Backprop through softmax
+                // dpreatt_bth[t3] += sum_t2 att_bth[t2]*(indicator(t2==t3)-att_bth[t3])*datt_bth[t2]
+                for t2 in 0..valid_len {
+                    for t3 in 0..valid_len {
+                        let indicator = if t2 == t3 {1.0f32} else {0.0f32};
+                        let local_derivative = att_bth[t2]*(indicator - att_bth[t3]);
+                        dpreatt_bth[t3] += local_derivative * datt_bth[t2];
+                    }
+                }
+
+                // STEP 3: Backprop through preatt = scale*(query⋅key)
+                // dquery[i] += key[i]*dpreatt_bth[t2]*scale
+                // dkey[i]   += query[i]*dpreatt_bth[t2]*scale
+                for t2 in 0..valid_len {
+                    let key_t2_start = b_idx * t * c3 + t2 * c3 + h * hs + c; // +c for key
+                    let dp = dpreatt_bth[t2]*scale;
+                    for i in 0..hs {
+                        // update dquery
+                        dinp[query_start + i] += inp[key_t2_start + i]*dp;
+                        // update dkey
+                        dinp[key_t2_start + i] += inp[query_start + i]*dp;
+                    }
+                }
             }
         }
     }
@@ -1270,7 +1366,185 @@ impl GPT2 {
             t,
             c);
 
+        // Convenience references
+        let params = &self.params;
+        let grads = &mut self.grads;
+        let acts = &self.acts;
+        let grads_acts = &mut self.grads_acts;
 
+        for layer_idx in (0..l).rev() {
+
+            let (residual, dresidual) = if layer_idx == 0 {
+                (&acts.encoded[..], &mut grads_acts.encoded[..])
+            } else {
+                let start = (layer_idx - 1) * b * t * c;
+                let end = start + b * t * c;
+                (&acts.residual3[start..end], &mut grads_acts.residual3[start..end])
+            };
+
+            let l_ln1w = &params.ln1w[layer_idx * c .. (layer_idx + 1) * c];
+            let l_qkvw = &params.qkvw[layer_idx * 3 * c * c .. (layer_idx + 1) * 3 * c * c];
+            let l_attprojw = &params.attprojw[layer_idx * c * c .. (layer_idx + 1) * c * c];
+            let l_ln2w = &params.ln2w[layer_idx * c .. (layer_idx + 1) * c];
+            let l_fcw = &params.fcw[layer_idx * 4 * c * c .. (layer_idx + 1) * 4 * c * c];
+            let l_fcprojw = &params.fcprojw[layer_idx * c * 4 * c .. (layer_idx + 1) * c * 4 * c];
+
+            let dl_ln1w = &mut grads.ln1w[layer_idx * c .. (layer_idx + 1) * c];
+            let dl_ln1b = &mut grads.ln1b[layer_idx * c .. (layer_idx + 1) * c];
+            let dl_qkvw = &mut grads.qkvw[layer_idx * 3 * c * c .. (layer_idx + 1) * 3 * c * c];
+            let dl_qkvb = &mut grads.qkvb[layer_idx * 3 * c .. (layer_idx + 1) * 3 * c];
+            let dl_attprojw = &mut grads.attprojw[layer_idx * c * c .. (layer_idx + 1) * c * c];
+            let dl_attprojb = &mut grads.attprojb[layer_idx * c .. (layer_idx + 1) * c];
+            let dl_ln2w = &mut grads.ln2w[layer_idx * c .. (layer_idx + 1) * c];
+            let dl_ln2b = &mut grads.ln2b[layer_idx * c .. (layer_idx + 1) * c];
+            let dl_fcw = &mut grads.fcw[layer_idx * 4 * c * c .. (layer_idx + 1) * 4 * c * c];
+            let dl_fcb = &mut grads.fcb[layer_idx * 4 * c .. (layer_idx + 1) * 4 * c];
+            let dl_fcprojw = &mut grads.fcprojw[layer_idx * c * 4 * c .. (layer_idx + 1) * c * 4 * c];
+            let dl_fcprojb = &mut grads.fcprojb[layer_idx * c .. (layer_idx + 1) * c];
+
+            let start_bt_c = layer_idx * b * t * c;
+            let end_bt_c = start_bt_c + b * t * c;
+            let l_ln1 = &acts.ln1[start_bt_c..end_bt_c];
+            let l_ln1_mean = &acts.ln1_mean[layer_idx * b * t .. layer_idx * b * t + b * t];
+            let l_ln1_rstd = &acts.ln1_rstd[layer_idx * b * t .. layer_idx * b * t + b * t];
+            let l_qkv = &acts.qkv[layer_idx * b * t * 3*c .. (layer_idx+1)*b * t * 3*c];
+            let l_atty = &acts.atty[start_bt_c..end_bt_c];
+            let l_att = &acts.att[layer_idx * b * nh * t * t .. (layer_idx+1)*b * nh * t * t];
+            let l_residual2 = &acts.residual2[start_bt_c..end_bt_c];
+            let l_ln2 = &acts.ln2[start_bt_c..end_bt_c];
+            let l_ln2_mean = &acts.ln2_mean[layer_idx * b * t .. layer_idx * b * t + b * t];
+            let l_ln2_rstd = &acts.ln2_rstd[layer_idx * b * t .. layer_idx * b * t + b * t];
+            let l_fch = &acts.fch[layer_idx * b * t * 4*c .. (layer_idx+1)*b * t * 4*c];
+            let l_fch_gelu = &acts.fch_gelu[layer_idx * b * t * 4*c .. (layer_idx+1)*b * t * 4*c];
+
+            {
+                // Borrow each of these as needed in separate blocks:
+                let dl_ln1 = &mut grads_acts.ln1[start_bt_c..end_bt_c];
+                let dl_qkv = &mut grads_acts.qkv[layer_idx * b * t * 3*c .. (layer_idx+1)*b * t * 3*c];
+                let dl_atty = &mut grads_acts.atty[start_bt_c..end_bt_c];
+                let dl_preatt = &mut grads_acts.preatt[layer_idx * b * nh * t * t .. (layer_idx+1)*b * nh * t * t];
+                let dl_att = &mut grads_acts.att[layer_idx * b * nh * t * t .. (layer_idx+1)*b * nh * t * t];
+                let dl_attproj = &mut grads_acts.attproj[start_bt_c..end_bt_c];
+                let dl_residual2 = &mut grads_acts.residual2[start_bt_c..end_bt_c];
+                let dl_ln2 = &mut grads_acts.ln2[start_bt_c..end_bt_c];
+                let dl_fch = &mut grads_acts.fch[layer_idx * b * t * 4*c .. (layer_idx+1)*b * t * 4*c];
+                let dl_fch_gelu = &mut grads_acts.fch_gelu[layer_idx * b * t * 4*c .. (layer_idx+1)*b * t * 4*c];
+                let dl_fcproj = &mut grads_acts.fcproj[start_bt_c..end_bt_c];
+
+                let dl_residual3 = &mut grads_acts.residual3[start_bt_c..end_bt_c];
+                residual_backward(dl_residual2, dl_fcproj, dl_residual3, b*t*c);
+
+
+                // Now dl_residual3 is out of scope, we can safely borrow dl_fcproj or others again if needed
+                matmul_backward_blas(
+                    dl_fch_gelu,
+                    dl_fcprojw,
+                    Some(dl_fcprojb),
+                    dl_fcproj,
+                    l_fch_gelu,
+                    l_fcprojw,
+                    b,
+                    t,
+                    4*c,
+                    c
+                );
+                gelu_backward(dl_fch, l_fch, dl_fch_gelu, b*t*4*c);
+                matmul_backward_blas(
+                    dl_ln2,
+                    dl_fcw,
+                    Some(dl_fcb),
+                    dl_fch,
+                    l_ln2,
+                    l_fcw,
+                    b,
+                    t,
+                    c,
+                    4*c
+                );
+                layernorm_backward(
+                    dl_residual2,
+                    dl_ln2w,
+                    dl_ln2b,
+                    dl_ln2,
+                    l_residual2,
+                    l_ln2w,
+                    l_ln2_mean,
+                    l_ln2_rstd,
+                    b,
+                    t,
+                    c
+                );
+
+
+                // Another scope for dl_attproj, dl_residual2, and dresidual
+                // Make sure dl_attproj has not been borrowed previously in this loop iteration
+                let dl_residual2 = &mut grads_acts.residual2[start_bt_c..end_bt_c];
+                let dl_attproj = &mut grads_acts.attproj[start_bt_c..end_bt_c];
+
+                residual_backward(dresidual, dl_attproj, dl_residual2, b*t*c);
+
+
+                matmul_backward_blas(
+                    dl_atty,
+                    dl_attprojw,
+                    Some(dl_attprojb),
+                    dl_attproj,
+                    l_atty,
+                    l_attprojw,
+                    b,
+                    t,
+                    c,
+                    c
+                );
+                attention_backward(
+                    dl_qkv,
+                    dl_preatt,
+                    dl_att,
+                    dl_atty,
+                    l_qkv,
+                    l_att,
+                    b,
+                    t,
+                    c,
+                    nh
+                );
+                matmul_backward_blas(
+                    dl_ln1,
+                    dl_qkvw,
+                    Some(dl_qkvb),
+                    dl_qkv,
+                    l_ln1,
+                    l_qkvw,
+                    b,
+                    t,
+                    c,
+                    3*c
+                );
+                layernorm_backward(
+                    dresidual,
+                    dl_ln1w,
+                    dl_ln1b,
+                    dl_ln1,
+                    residual,
+                    l_ln1w,
+                    l_ln1_mean,
+                    l_ln1_rstd,
+                    b,
+                    t,
+                    c
+                );
+            } // all dl_* borrows end here
+        }
+
+        encoder_backward(
+            &mut self.grads.wte,
+            &mut self.grads.wpe,
+            &mut self.grads_acts.encoded,
+            &self.inputs,
+            b,
+            t,
+            c
+        );
 
         Ok(())
     }
