@@ -1532,11 +1532,18 @@ impl GPT2 {
                 let mut local_residual2 = self.grads_acts.residual2[start_bt_c..end_bt_c].to_vec();
                 let dresidual_slice_start = dresidual_slice_range.start;
                 let dresidual_slice_end = dresidual_slice_range.end;
-                let mut local_dresidual = self.grads_acts.encoded[dresidual_slice_start..dresidual_slice_end].to_vec();
-                // If layer_idx > 0, this should be residual3 slice instead of encoded. Adjust accordingly:
-                if layer_idx > 0 {
-                    local_dresidual = self.grads_acts.residual3[dresidual_slice_start..dresidual_slice_end].to_vec();
-                }
+                // let mut local_dresidual: Vec<f32> = self.grads_acts.encoded[dresidual_slice_start..dresidual_slice_end].to_vec();
+                // // If layer_idx > 0, this should be residual3 slice instead of encoded. Adjust accordingly:
+                // if layer_idx > 0 {
+                //     local_dresidual = self.grads_acts.residual3[dresidual_slice_start..dresidual_slice_end].to_vec();
+                // }
+                let mut local_dresidual = if layer_idx == 0 {
+                    // layer_idx == 0: use encoded
+                    self.grads_acts.encoded[dresidual_slice_range.clone()].to_vec()
+                } else {
+                    // layer_idx > 0: use residual3
+                    self.grads_acts.residual3[dresidual_slice_range.clone()].to_vec()
+                };
 
                 residual_backward(&mut local_dresidual, &mut local_attproj, &mut local_residual2, b*t*c);
 
@@ -1604,6 +1611,7 @@ impl GPT2 {
                 self.grads_acts.att[att_range.clone()].copy_from_slice(&local_att);
                 self.grads_acts.atty[start_bt_c..end_bt_c].copy_from_slice(&local_atty);
             }
+
 
             // qkv backward
             {
@@ -1692,6 +1700,7 @@ impl GPT2 {
 
         Ok(())
     }
+
 
 
     pub fn update(&mut self, learning_rate: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32, t: usize) {
