@@ -497,6 +497,137 @@ fn attention_backward(
 
     dpreatt.fill(0.0);
     datt.fill(0.0);
+
+    let alpha = 1.0_f32;
+    let beta = 0.0_f32;
+
+    for b_idx in 0..b {
+        for t_idx in 0..t {
+            let valid_len = t_idx + 1;
+            for h_idx in 0..nh {
+                // Index computations
+                let att_start = b_idx * nh * t * t + h_idx * t * t + t_idx * t;
+                let preatt_start = att_start;
+
+                // att_bth: slice containing att for this (b, h, t_idx)
+                let att_bth = &att[att_start..att_start + valid_len];
+                let datt_bth = &mut datt[att_start..att_start + valid_len];
+                let dpreatt_bth = &mut dpreatt[preatt_start..preatt_start + valid_len];
+
+                let dout_offset = b_idx * t * c + t_idx * c + h_idx * hs;
+                let dout_bth = &dout[dout_offset .. dout_offset + hs];
+
+                // Extract query for this t_idx
+                let query_start = b_idx * t * c3 + t_idx * c3 + h_idx * hs;
+                let query_vec = &inp[query_start .. query_start + hs]; // (hs)
+
+                // Extract the Keys and Values for rows 0..=t_idx (valid_len rows)
+                let mut K_mat = vec![0.0f32; valid_len * hs];
+                let mut V_mat = vec![0.0f32; valid_len * hs];
+                for i in 0..valid_len {
+                    let base = b_idx * t * c3 + i * c3 + h_idx * hs;
+                    let key_row = &inp[base + c .. base + c + hs];      // keys
+                    let val_row = &inp[base + 2*c .. base + 2*c + hs];  // values
+                    K_mat[i*hs..i*hs+hs].copy_from_slice(key_row);
+                    V_mat[i*hs..i*hs+hs].copy_from_slice(val_row);
+                }
+
+                // STEP 1: Backprop through value accumulation
+                // out_bth[i] += att_bth[t2]*value_t2[i]
+                // datt_bth[t2] += value_t2[i]*dout_bth[i]
+                // dvalue_t2[i] += att_bth[t2]*dout_bth[i]
+                for t2 in 0..valid_len {
+                    let value_t2_start = b_idx * t * c3 + t2 * c3 + h_idx * hs + 2 * c;
+                    for i in 0..hs {
+                        datt_bth[t2] += inp[value_t2_start + i] * dout_bth[i];
+                        dinp[value_t2_start + i] += att_bth[t2] * dout_bth[i];
+                    }
+                }
+
+                // STEP 2: Backprop through softmax
+                // dpreatt_bth[t3] += Σ_t2 att_bth[t2]*(δ_{t2,t3}-att_bth[t3])*datt_bth[t2]
+                for t3 in 0..valid_len {
+                    let mut sum = 0.0f32;
+                    for t2 in 0..valid_len {
+                        let indicator = if t2 == t3 { 1.0 } else { 0.0 };
+                        let local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
+                        sum += local_derivative * datt_bth[t2];
+                    }
+                    dpreatt_bth[t3] += sum;
+                }
+
+                // STEP 3: Backprop through preatt = scale*(query⋅key)
+                // dquery[i] += Σ_t2 K[t2, i]*dpreatt_bth[t2]*scale
+                // dkey[i]   += query[i]*dpreatt_bth[t2]*scale
+                //
+                // Let's use sgemm for these operations now. But first we handle them like:
+                // dQ = dpreatt_bth (1 x valid_len) * K_mat (valid_len x hs)
+                // dK = dpreatt_bth^T (valid_len x 1) * query_vec (1 x hs) - done manually
+
+                // We'll do them as vector operations using sgemm with proper shapes:
+                // For dquery: We want a (1xhs) result = (1 x valid_len) * (valid_len x hs)
+                // Treat dpreatt_bth as a 1x(valid_len) row, K_mat as (valid_len x hs).
+                let mut dpreatt_row = dpreatt_bth.to_vec(); // (valid_len)
+                for v in &mut dpreatt_row {
+                    *v *= scale;
+                }
+
+                let mut dQ = vec![0.0f32; hs];
+                unsafe {
+                    sgemm(
+                        Layout::RowMajor,
+                        Transpose::None,   // (1xvalid_len)
+                        Transpose::None,   // (valid_len x hs)
+                        1,                 // M=1
+                        hs as i32,         // N=hs
+                        valid_len as i32,  // K=valid_len
+                        1.0,
+                        &dpreatt_row, valid_len as i32,
+                        &K_mat, hs as i32,
+                        0.0,
+                        &mut dQ, hs as i32,
+                    );
+                }
+
+                // Accumulate dQ into dinp at query position
+                for i in 0..hs {
+                    dinp[query_start + i] += dQ[i];
+                }
+
+                // For dK: dpreatt_bth (valid_len) * query_vec (hs)
+                // This is actually (valid_len x hs) = (valid_len x 1)*(1 x hs), so we do outer product:
+                // dpreatt_bth[i]*query_vec[j]
+                for t2 in 0..valid_len {
+                    let dp = dpreatt_row[t2]; // already includes scale
+                    let key_t2_start = b_idx * t * c3 + t2 * c3 + h_idx * hs + c;
+                    for i in 0..hs {
+                        dinp[key_t2_start + i] += query_vec[i]*dp;
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+fn attention_backward_1(
+    dinp: &mut [f32],
+    dpreatt: &mut [f32],
+    datt: &mut [f32],
+    dout: &[f32],
+    inp: &[f32],
+    att: &[f32],
+    b: usize,
+    t: usize,
+    c: usize,
+    nh: usize,
+) {
+    let c3 = c * 3;
+    let hs = c / nh;
+    let scale = 1.0 / (hs as f32).sqrt();
+
+    dpreatt.fill(0.0);
+    datt.fill(0.0);
     // If needed, zero out dinp as well:
     // dinp.fill(0.0);
 
@@ -1400,6 +1531,7 @@ impl GPT2 {
             self.grads_acts.lnf.copy_from_slice(&local_dlnf);
         }
 
+        let start_time = Instant::now();
         // Now handle each layer in reverse order
         for layer_idx in (0..l).rev() {
             let (residual_slice, dresidual_slice_range) = if layer_idx == 0 {
@@ -1414,6 +1546,7 @@ impl GPT2 {
             let start_bt_c = layer_idx * b * t * c;
             let end_bt_c = start_bt_c + b * t * c;
 
+            let start_residual_backward = Instant::now();
             // residual_backward on residual3
             {
                 // We need dl_residual2, dl_fcproj, dl_residual3 from grads_acts overlapping
@@ -1428,8 +1561,11 @@ impl GPT2 {
                 self.grads_acts.fcproj[start_bt_c..end_bt_c].copy_from_slice(&local_fcproj);
                 self.grads_acts.residual3[start_bt_c..end_bt_c].copy_from_slice(&local_residual3);
             }
+            let end_residual_backward = start_residual_backward.elapsed();
+            println!("Time taken for residual_backward: {:?}", end_residual_backward);
 
             // fcproj backward + gelu backward + fcw backward
+            let start_fcproj_backward = Instant::now();
             {
                 let fch_range = layer_idx * b * t * 4 * c .. (layer_idx + 1)* b * t * 4 * c;
 
@@ -1495,8 +1631,11 @@ impl GPT2 {
                 self.grads_acts.fch_gelu[fch_range.clone()].copy_from_slice(&local_fch_gelu);
                 self.grads_acts.ln2[start_bt_c..end_bt_c].copy_from_slice(&local_ln2);
             }
+            let end_fcproj_backward = start_fcproj_backward.elapsed();
+            println!("Time taken for fcproj_backward: {:?}", end_fcproj_backward);
 
             // ln2 backward
+            let start_ln2_backward = Instant::now();
             {
                 // Similar pattern: clone what ln2 backward modifies
                 let mut local_ln2 = self.grads_acts.ln2[start_bt_c..end_bt_c].to_vec();
@@ -1525,8 +1664,11 @@ impl GPT2 {
                 self.grads.ln2w[layer_idx * c..(layer_idx + 1)*c].copy_from_slice(&local_ln2w);
                 self.grads.ln2b[layer_idx * c..(layer_idx + 1)*c].copy_from_slice(&local_ln2b);
             }
+            let end_ln2_backward = start_ln2_backward.elapsed();
+            println!("Time taken for ln2_backward: {:?}", end_ln2_backward);
 
             // residual backward for residual2, attproj
+            let start_residual2_attproj = Instant::now();
             {
                 let mut local_attproj = self.grads_acts.attproj[start_bt_c..end_bt_c].to_vec();
                 let mut local_residual2 = self.grads_acts.residual2[start_bt_c..end_bt_c].to_vec();
@@ -1556,8 +1698,11 @@ impl GPT2 {
                 self.grads_acts.attproj[start_bt_c..end_bt_c].copy_from_slice(&local_attproj);
                 self.grads_acts.residual2[start_bt_c..end_bt_c].copy_from_slice(&local_residual2);
             }
+            let end_residual2_attproj = start_residual2_attproj.elapsed();
+            println!("Time taken for residual2_attproj: {:?}", end_residual2_attproj);
 
             // attproj backward
+            let start_attproj = Instant::now();
             {
                 let mut local_attproj = self.grads_acts.attproj[start_bt_c..end_bt_c].to_vec();
                 let mut local_atty = self.grads_acts.atty[start_bt_c..end_bt_c].to_vec();
@@ -1582,8 +1727,11 @@ impl GPT2 {
                 self.grads.attprojw[layer_idx * c * c..(layer_idx+1)*c*c].copy_from_slice(&local_attprojw);
                 self.grads.attprojb[layer_idx * c..(layer_idx+1)*c].copy_from_slice(&local_attprojb);
             }
+            let end_attproj = start_attproj.elapsed();
+            println!("Time taken for attproj_backward: {:?}", end_attproj);
 
             // attention backward
+            let start_attention_backward = Instant::now();
             {
                 let qkv_range = layer_idx * b * t * 3 * c .. (layer_idx+1)*b*t*3*c;
                 let att_range = layer_idx * b * nh * t * t .. (layer_idx+1)*b*nh*t*t;
@@ -1611,6 +1759,8 @@ impl GPT2 {
                 self.grads_acts.att[att_range.clone()].copy_from_slice(&local_att);
                 self.grads_acts.atty[start_bt_c..end_bt_c].copy_from_slice(&local_atty);
             }
+            let end_attention_backward = start_attention_backward.elapsed();
+            println!("Time taken for attention_backward: {:?}", end_attention_backward);
 
 
             // qkv backward
@@ -1680,7 +1830,9 @@ impl GPT2 {
             }
 
         }
-
+        let end_time = start_time.elapsed();
+        println!("Time taken for backward pass: {:?}", end_time);
+        let start_time = Instant::now();
         // Finally, backprop into encoder embeddings
         {
             let local_encoded = self.grads_acts.encoded.clone();
@@ -1697,6 +1849,8 @@ impl GPT2 {
             // If encoder_backward modifies encoded grads in place, copy back as needed.
             self.grads_acts.encoded.copy_from_slice(&local_encoded);
         }
+        let end_time = start_time.elapsed();
+        println!("Time taken for encoder backward pass: {:?}", end_time);
 
         Ok(())
     }
@@ -1940,7 +2094,10 @@ fn main() {
         for _ in 0..train_loader.num_batches {
             train_loader.next_batch();
             model.zero_grad();
+            let starter = Instant::now();
             model.forward(&train_loader.inputs, Some(&train_loader.targets), B, T);
+            let end_time = starter.elapsed();
+            println!("Time taken for forward pass: {:?}", end_time);
             println!("train loss: {}", model.mean_loss);
             println!("Backward");
             model.backward();

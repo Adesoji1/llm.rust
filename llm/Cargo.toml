@@ -20,3 +20,4 @@ incremental = false
 overflow-checks = false
 debug-assertions = false
 opt-level = 3
+debug = true
