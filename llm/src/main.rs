@@ -1523,7 +1523,7 @@ impl GPT2 {
             self.grads_acts.lnf.copy_from_slice(&local_dlnf);
         }
 
-        let start_time = Instant::now();
+        //let start_time = Instant::now();
         // Now handle each layer in reverse order
         for layer_idx in (0..l).rev() {
             let (residual_slice, dresidual_slice_range) = if layer_idx == 0 {
@@ -1538,7 +1538,7 @@ impl GPT2 {
             let start_bt_c = layer_idx * b * t * c;
             let end_bt_c = start_bt_c + b * t * c;
 
-            let start_residual_backward = Instant::now();
+            //let start_residual_backward = Instant::now();
             // residual_backward on residual3
             {
                 // We need dl_residual2, dl_fcproj, dl_residual3 from grads_acts overlapping
@@ -1553,11 +1553,11 @@ impl GPT2 {
                 self.grads_acts.fcproj[start_bt_c..end_bt_c].copy_from_slice(&local_fcproj);
                 self.grads_acts.residual3[start_bt_c..end_bt_c].copy_from_slice(&local_residual3);
             }
-            let end_residual_backward = start_residual_backward.elapsed();
-            println!("Time taken for residual_backward: {:?}", end_residual_backward);
+            //let end_residual_backward = start_residual_backward.elapsed();
+            //println!("Time taken for residual_backward: {:?}", end_residual_backward);
 
             // fcproj backward + gelu backward + fcw backward
-            let start_fcproj_backward = Instant::now();
+            //let start_fcproj_backward = Instant::now();
             {
                 let fch_range = layer_idx * b * t * 4 * c .. (layer_idx + 1)* b * t * 4 * c;
 
@@ -1623,11 +1623,11 @@ impl GPT2 {
                 self.grads_acts.fch_gelu[fch_range.clone()].copy_from_slice(&local_fch_gelu);
                 self.grads_acts.ln2[start_bt_c..end_bt_c].copy_from_slice(&local_ln2);
             }
-            let end_fcproj_backward = start_fcproj_backward.elapsed();
-            println!("Time taken for fcproj_backward: {:?}", end_fcproj_backward);
+            //let end_fcproj_backward = start_fcproj_backward.elapsed();
+            //println!("Time taken for fcproj_backward: {:?}", end_fcproj_backward);
 
             // ln2 backward
-            let start_ln2_backward = Instant::now();
+            //let start_ln2_backward = Instant::now();
             {
                 // Similar pattern: clone what ln2 backward modifies
                 let mut local_ln2 = self.grads_acts.ln2[start_bt_c..end_bt_c].to_vec();
@@ -1656,11 +1656,11 @@ impl GPT2 {
                 self.grads.ln2w[layer_idx * c..(layer_idx + 1)*c].copy_from_slice(&local_ln2w);
                 self.grads.ln2b[layer_idx * c..(layer_idx + 1)*c].copy_from_slice(&local_ln2b);
             }
-            let end_ln2_backward = start_ln2_backward.elapsed();
-            println!("Time taken for ln2_backward: {:?}", end_ln2_backward);
+            //let end_ln2_backward = start_ln2_backward.elapsed();
+            //println!("Time taken for ln2_backward: {:?}", end_ln2_backward);
 
             // residual backward for residual2, attproj
-            let start_residual2_attproj = Instant::now();
+            //let start_residual2_attproj = Instant::now();
             {
                 let mut local_attproj = self.grads_acts.attproj[start_bt_c..end_bt_c].to_vec();
                 let mut local_residual2 = self.grads_acts.residual2[start_bt_c..end_bt_c].to_vec();
@@ -1690,11 +1690,11 @@ impl GPT2 {
                 self.grads_acts.attproj[start_bt_c..end_bt_c].copy_from_slice(&local_attproj);
                 self.grads_acts.residual2[start_bt_c..end_bt_c].copy_from_slice(&local_residual2);
             }
-            let end_residual2_attproj = start_residual2_attproj.elapsed();
-            println!("Time taken for residual2_attproj: {:?}", end_residual2_attproj);
+            //let end_residual2_attproj = start_residual2_attproj.elapsed();
+            //println!("Time taken for residual2_attproj: {:?}", end_residual2_attproj);
 
             // attproj backward
-            let start_attproj = Instant::now();
+            //let start_attproj = Instant::now();
             {
                 let mut local_attproj = self.grads_acts.attproj[start_bt_c..end_bt_c].to_vec();
                 let mut local_atty = self.grads_acts.atty[start_bt_c..end_bt_c].to_vec();
@@ -1719,11 +1719,11 @@ impl GPT2 {
                 self.grads.attprojw[layer_idx * c * c..(layer_idx+1)*c*c].copy_from_slice(&local_attprojw);
                 self.grads.attprojb[layer_idx * c..(layer_idx+1)*c].copy_from_slice(&local_attprojb);
             }
-            let end_attproj = start_attproj.elapsed();
-            println!("Time taken for attproj_backward: {:?}", end_attproj);
+            //let end_attproj = start_attproj.elapsed();
+            //println!("Time taken for attproj_backward: {:?}", end_attproj);
 
             // attention backward
-            let start_attention_backward = Instant::now();
+            //let start_attention_backward = Instant::now();
             {
                 let qkv_range = layer_idx * b * t * 3 * c .. (layer_idx+1)*b*t*3*c;
                 let att_range = layer_idx * b * nh * t * t .. (layer_idx+1)*b*nh*t*t;
@@ -1751,8 +1751,8 @@ impl GPT2 {
                 self.grads_acts.att[att_range.clone()].copy_from_slice(&local_att);
                 self.grads_acts.atty[start_bt_c..end_bt_c].copy_from_slice(&local_atty);
             }
-            let end_attention_backward = start_attention_backward.elapsed();
-            println!("Time taken for attention_backward: {:?}", end_attention_backward);
+            //let end_attention_backward = start_attention_backward.elapsed();
+            //println!("Time taken for attention_backward: {:?}", end_attention_backward);
 
 
             // qkv backward
@@ -1822,9 +1822,9 @@ impl GPT2 {
             }
 
         }
-        let end_time = start_time.elapsed();
-        println!("Time taken for backward pass: {:?}", end_time);
-        let start_time = Instant::now();
+        //let end_time = start_time.elapsed();
+        //println!("Time taken for backward pass: {:?}", end_time);
+        //let start_time = Instant::now();
         // Finally, backprop into encoder embeddings
         {
             let local_encoded = self.grads_acts.encoded.clone();
@@ -1841,8 +1841,8 @@ impl GPT2 {
             // If encoder_backward modifies encoded grads in place, copy back as needed.
             self.grads_acts.encoded.copy_from_slice(&local_encoded);
         }
-        let end_time = start_time.elapsed();
-        println!("Time taken for encoder backward pass: {:?}", end_time);
+        //let end_time = start_time.elapsed();
+        //println!("Time taken for encoder backward pass: {:?}", end_time);
 
         Ok(())
     }
@@ -2092,27 +2092,30 @@ fn main() {
             println!("Time taken for forward pass: {:?}", end_time);
             println!("train loss: {}", model.mean_loss);
             println!("Backward");
+            let starter = Instant::now();
             model.backward();
+            let end_time = starter.elapsed();
+            println!("Time taken for backward pass: {:?}", end_time);
             let grad_mean: f32 = model.grads_memory.iter().sum::<f32>() / model.grads_memory.len() as f32;
             println!("Gradient mean: {}", grad_mean);
             println!("Update");
             model.update(1e-4, 0.9, 0.999, 1e-8, 0.0, step+1);
         }
         println!("validation");
-        // if step % 10 == 0 {
-        //     let mut val_loss = 0.0;
-        //     println!("validation reset");
-        //     val_loader.reset();
-        //     for _ in 0..val_num_batches {
-        //         println!("validation nexdt batch ");
-        //         val_loader.next_batch();
-        //         println!("model forward for validation");
-        //         model.forward(&val_loader.inputs, Some(&val_loader.targets), B, T);
-        //         println!("val loss");
-        //         val_loss += model.mean_loss;
-        //     }
-        //     val_loss /= val_num_batches as f32;
-        //     println!("val loss: {}", val_loss);
-        // }
+        if step % 10 == 0 {
+            let mut val_loss = 0.0;
+            println!("validation reset");
+            val_loader.reset();
+            for _ in 0..val_num_batches {
+                println!("validation nexdt batch ");
+                val_loader.next_batch();
+                println!("model forward for validation");
+                model.forward(&val_loader.inputs, Some(&val_loader.targets), B, T);
+                println!("val loss");
+                val_loss += model.mean_loss;
+            }
+            val_loss /= val_num_batches as f32;
+            println!("val loss: {}", val_loss);
+        }
     }
 }
