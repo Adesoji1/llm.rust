@@ -495,57 +495,48 @@ fn attention_backward(
     let hs = c / nh;
     let scale = 1.0 / (hs as f32).sqrt();
 
-    dpreatt.fill(0.0);
-    datt.fill(0.0);
+    let global_dinp = Mutex::new(vec![0.0f32; dinp.len()]);
+    let global_datt = Mutex::new(vec![0.0f32; datt.len()]);
+    let global_dpreatt = Mutex::new(vec![0.0f32; dpreatt.len()]);
 
-    let alpha = 1.0_f32;
-    let beta = 0.0_f32;
+    (0..b).into_par_iter().for_each(|b_idx| {
+        let mut local_dinp = vec![0.0f32; dinp.len()];
+        let mut local_datt = vec![0.0f32; datt.len()];
+        let mut local_dpreatt = vec![0.0f32; dpreatt.len()];
 
-    for b_idx in 0..b {
         for t_idx in 0..t {
-            let valid_len = t_idx + 1;
             for h_idx in 0..nh {
-                // Index computations
+                let valid_len = t_idx + 1;
+
                 let att_start = b_idx * nh * t * t + h_idx * t * t + t_idx * t;
                 let preatt_start = att_start;
-
-                // att_bth: slice containing att for this (b, h, t_idx)
-                let att_bth = &att[att_start..att_start + valid_len];
-                let datt_bth = &mut datt[att_start..att_start + valid_len];
-                let dpreatt_bth = &mut dpreatt[preatt_start..preatt_start + valid_len];
-
-                let dout_offset = b_idx * t * c + t_idx * c + h_idx * hs;
-                let dout_bth = &dout[dout_offset .. dout_offset + hs];
-
-                // Extract query for this t_idx
                 let query_start = b_idx * t * c3 + t_idx * c3 + h_idx * hs;
-                let query_vec = &inp[query_start .. query_start + hs]; // (hs)
+                let dout_offset = b_idx * t * c + t_idx * c + h_idx * hs;
 
-                // Extract the Keys and Values for rows 0..=t_idx (valid_len rows)
+                let att_bth = &att[att_start..att_start + valid_len];
+                let datt_bth = &mut local_datt[att_start..att_start + valid_len];
+                let dpreatt_bth = &mut local_dpreatt[preatt_start..preatt_start + valid_len];
+                let dout_bth = &dout[dout_offset..dout_offset + hs];
+
                 let mut K_mat = vec![0.0f32; valid_len * hs];
                 let mut V_mat = vec![0.0f32; valid_len * hs];
-                for i in 0..valid_len {
-                    let base = b_idx * t * c3 + i * c3 + h_idx * hs;
-                    let key_row = &inp[base + c .. base + c + hs];      // keys
-                    let val_row = &inp[base + 2*c .. base + 2*c + hs];  // values
-                    K_mat[i*hs..i*hs+hs].copy_from_slice(key_row);
-                    V_mat[i*hs..i*hs+hs].copy_from_slice(val_row);
+
+                for t2 in 0..valid_len {
+                    let base = b_idx * t * c3 + t2 * c3 + h_idx * hs;
+                    let key_row = &inp[base + c..base + c + hs];
+                    let val_row = &inp[base + 2 * c..base + 2 * c + hs];
+                    K_mat[t2 * hs..(t2 + 1) * hs].copy_from_slice(key_row);
+                    V_mat[t2 * hs..(t2 + 1) * hs].copy_from_slice(val_row);
                 }
 
-                // STEP 1: Backprop through value accumulation
-                // out_bth[i] += att_bth[t2]*value_t2[i]
-                // datt_bth[t2] += value_t2[i]*dout_bth[i]
-                // dvalue_t2[i] += att_bth[t2]*dout_bth[i]
                 for t2 in 0..valid_len {
                     let value_t2_start = b_idx * t * c3 + t2 * c3 + h_idx * hs + 2 * c;
                     for i in 0..hs {
                         datt_bth[t2] += inp[value_t2_start + i] * dout_bth[i];
-                        dinp[value_t2_start + i] += att_bth[t2] * dout_bth[i];
+                        local_dinp[value_t2_start + i] += att_bth[t2] * dout_bth[i];
                     }
                 }
 
-                // STEP 2: Backprop through softmax
-                // dpreatt_bth[t3] += Σ_t2 att_bth[t2]*(δ_{t2,t3}-att_bth[t3])*datt_bth[t2]
                 for t3 in 0..valid_len {
                     let mut sum = 0.0f32;
                     for t2 in 0..valid_len {
@@ -556,57 +547,58 @@ fn attention_backward(
                     dpreatt_bth[t3] += sum;
                 }
 
-                // STEP 3: Backprop through preatt = scale*(query⋅key)
-                // dquery[i] += Σ_t2 K[t2, i]*dpreatt_bth[t2]*scale
-                // dkey[i]   += query[i]*dpreatt_bth[t2]*scale
-                //
-                // Let's use sgemm for these operations now. But first we handle them like:
-                // dQ = dpreatt_bth (1 x valid_len) * K_mat (valid_len x hs)
-                // dK = dpreatt_bth^T (valid_len x 1) * query_vec (1 x hs) - done manually
-
-                // We'll do them as vector operations using sgemm with proper shapes:
-                // For dquery: We want a (1xhs) result = (1 x valid_len) * (valid_len x hs)
-                // Treat dpreatt_bth as a 1x(valid_len) row, K_mat as (valid_len x hs).
-                let mut dpreatt_row = dpreatt_bth.to_vec(); // (valid_len)
-                for v in &mut dpreatt_row {
-                    *v *= scale;
-                }
+                let mut dpreatt_scaled = dpreatt_bth.to_vec();
+                dpreatt_scaled.iter_mut().for_each(|x| *x *= scale);
 
                 let mut dQ = vec![0.0f32; hs];
-                unsafe {
-                    sgemm(
-                        Layout::RowMajor,
-                        Transpose::None,   // (1xvalid_len)
-                        Transpose::None,   // (valid_len x hs)
-                        1,                 // M=1
-                        hs as i32,         // N=hs
-                        valid_len as i32,  // K=valid_len
-                        1.0,
-                        &dpreatt_row, valid_len as i32,
-                        &K_mat, hs as i32,
-                        0.0,
-                        &mut dQ, hs as i32,
-                    );
-                }
-
-                // Accumulate dQ into dinp at query position
-                for i in 0..hs {
-                    dinp[query_start + i] += dQ[i];
-                }
-
-                // For dK: dpreatt_bth (valid_len) * query_vec (hs)
-                // This is actually (valid_len x hs) = (valid_len x 1)*(1 x hs), so we do outer product:
-                // dpreatt_bth[i]*query_vec[j]
                 for t2 in 0..valid_len {
-                    let dp = dpreatt_row[t2]; // already includes scale
+                    let dp = dpreatt_scaled[t2];
+                    for i in 0..hs {
+                        dQ[i] += K_mat[t2 * hs + i] * dp;
+                    }
+                }
+                for i in 0..hs {
+                    local_dinp[query_start + i] += dQ[i];
+                }
+
+                for t2 in 0..valid_len {
+                    let dp = dpreatt_scaled[t2];
                     let key_t2_start = b_idx * t * c3 + t2 * c3 + h_idx * hs + c;
                     for i in 0..hs {
-                        dinp[key_t2_start + i] += query_vec[i]*dp;
+                        local_dinp[key_t2_start + i] += inp[query_start + i] * dp;
                     }
                 }
             }
         }
-    }
+
+        // Safely merge local results into global arrays
+        {
+            let mut g_dinp = global_dinp.lock().unwrap();
+            g_dinp
+                .iter_mut()
+                .zip(local_dinp.iter())
+                .for_each(|(g, l)| *g += l);
+        }
+        {
+            let mut g_datt = global_datt.lock().unwrap();
+            g_datt
+                .iter_mut()
+                .zip(local_datt.iter())
+                .for_each(|(g, l)| *g += l);
+        }
+        {
+            let mut g_dpreatt = global_dpreatt.lock().unwrap();
+            g_dpreatt
+                .iter_mut()
+                .zip(local_dpreatt.iter())
+                .for_each(|(g, l)| *g += l);
+        }
+    });
+
+    // Copy results back to the original mutable references
+    dinp.copy_from_slice(&global_dinp.lock().unwrap());
+    datt.copy_from_slice(&global_datt.lock().unwrap());
+    dpreatt.copy_from_slice(&global_dpreatt.lock().unwrap());
 }
 
 
