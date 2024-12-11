@@ -801,56 +801,62 @@ struct DataLoader {
     file_size: u64,
     current_position: u64,
     batch: Vec<i32>,
-    inputs: Vec<i32>,
-    targets: Vec<i32>,
+    inputs: Vec<i32>,  // Owned vector
+    targets: Vec<i32>, // Owned vector
     num_batches: usize,
 }
 
 impl DataLoader {
-    fn new(file_path: &Path, B: usize, T: usize) -> io::Result<Self>{
+    fn new(file_path: &Path, B: usize, T: usize) -> io::Result<Self> {
         let file = File::open(file_path)?;
         let mut reader = BufReader::new(file);
         let file_size = reader.seek(io::SeekFrom::End(0))?;
         reader.seek(io::SeekFrom::Start(0))?;
-        // Good lesson to show, trait is not in scope, we need to import it
-        if file_size < ((B*T+1)*std::mem::size_of::<i32>() as usize) as u64{
+
+        if file_size < ((B * T + 1) * std::mem::size_of::<i32>()) as u64 {
             return Err(io::Error::new(io::ErrorKind::Other, "File too small"));
         }
-        let mut loader = DataLoader{
+
+        let mut loader = DataLoader {
             B,
             T,
             tokens_file: reader,
             file_size,
             current_position: 0,
-            batch: vec![0; B*T+1],
-            inputs: vec![0; B*T+1],
-            targets: vec![0; B*T+1],
-            num_batches: (file_size / (B as u64*T as u64*std::mem::size_of::<i32>() as u64)) as usize,
+            batch: vec![0; B * T + 1],
+            inputs: vec![],  // Temporary placeholder
+            targets: vec![], // Temporary placeholder
+            num_batches: (file_size / (B * T * std::mem::size_of::<i32>() as usize) as u64) as usize,
         };
-        loader.inputs = loader.batch[0..].to_vec();
-        loader.targets = loader.batch[1..].to_vec();
 
+        loader.update_slices();
         Ok(loader)
-        }
+    }
+
     fn reset(&mut self) -> io::Result<()> {
-        // I added this seek to Start 0
-        //self.tokens_file.seek(SeekFrom::Start(0))?;
-        // this is the original bit
         self.current_position = 0;
         Ok(())
     }
-    fn next_batch(&mut self) -> io::Result<()>{
-        if self.current_position + (self.B * self.T +1) as u64 * std::mem::size_of::<i32>() as u64 > self.file_size {
+
+    fn next_batch(&mut self) -> io::Result<()> {
+        if self.current_position + (self.B * self.T + 1) as u64 * std::mem::size_of::<i32>() as u64 > self.file_size {
             self.current_position = 0;
         }
+
         self.tokens_file.seek(SeekFrom::Start(self.current_position))?;
         let buffer = self.batch.as_mut_slice();
-        let bytes_to_read = buffer.len() * std::mem::size_of::<i32>();
-        self.tokens_file.read_exact(bytemuck::cast_slice_mut(buffer))?; // bytemuck is a crate that provides safe and efficient byte conversion functions for Rust
-        self.current_position += self.B as u64 * self.T as u64 *std::mem::size_of::<i32>() as u64;
+        self.tokens_file.read_exact(bytemuck::cast_slice_mut(buffer))?;
+        self.current_position += (self.B * self.T) as u64 * std::mem::size_of::<i32>() as u64;
+
+        // Update slices to point to the new data
+        self.update_slices();
         Ok(())
     }
 
+    fn update_slices(&mut self) {
+        self.inputs = self.batch[0..self.B * self.T].to_vec();
+        self.targets = self.batch[1..=self.B * self.T].to_vec();
+    }
 }
 /* END OF DATALOADER CONFIGURATION */
 
@@ -1164,6 +1170,9 @@ impl GPT2 {
         let wpe = &self.params.wpe;
         // print size of wte and wpe
         encoder_forward(&mut self.acts.encoded, &inputs, &wte, &wpe, b, t, c);
+        // CHECK RUST VS C
+        // let mean_encoded = self.acts.encoded.iter().sum::<f32>() / self.acts.encoded.len() as f32;
+        // println!("Mean encoded activation (Rust): {:.6}", mean_encoded);
         // Process each layer
         for l in 0..self.config.num_layers {
             // Get the residual from the previous layer
@@ -1442,7 +1451,7 @@ impl GPT2 {
         if self.grads_memory.is_empty() {
             self.grads_memory.resize(self.num_parameters, 0.0);
             self.allocate_grad_activation_tensors(b, t, l, nh, c, v);
-            self.zero_grad();
+            //self.zero_grad();
         }
 
         let dloss_mean = 1.0 / (b * t) as f32;
@@ -1847,6 +1856,117 @@ impl GPT2 {
         Ok(())
     }
 
+    fn update_grads_memory(&mut self) {
+        let mut offset = 0;
+        let mut nan_count = 0;
+        let mut inf_count = 0;
+        let mut large_value_count = 0;
+
+        let mut max_val = f32::MIN;
+        let mut max_idx = 0;
+        let mut max_param_name: Option<String> = None;
+
+        let mut check_and_copy = |dest: &mut [f32], src: &[f32], param_name: &str, offset: &mut usize| {
+            println!("Checking param: {} | Offset: {} | Length: {}", param_name, *offset, src.len());
+
+            if *offset + src.len() > dest.len() {
+                panic!(
+                    "Attempt to access out-of-bounds memory in {}: Offset {}, Length {}",
+                    param_name, *offset, src.len()
+                );
+            }
+
+            for (i, &val) in src.iter().enumerate() {
+                let global_idx = *offset + i;
+
+                // Debug each parameter being checked
+                if i == 0 {
+                    println!(
+                        "Inspecting first value of {} at index {}: Value = {}",
+                        param_name, global_idx, val
+                    );
+                }
+
+                // Update maximum tracking
+                if val.abs() > max_val.abs() {
+                    max_val = val;
+                    max_idx = global_idx;
+                    max_param_name = Some(param_name.to_string());
+
+                    // Print whenever a new max is found
+                    println!(
+                        "New Max Found: {} in param {} at index {}",
+                        max_val, param_name, max_idx
+                    );
+                }
+
+                // Detect anomalies
+                if !val.is_finite() {
+                    if val.is_nan() {
+                        nan_count += 1;
+                        println!("NaN detected in {} at index {}", param_name, global_idx);
+                    } else {
+                        inf_count += 1;
+                        println!("Inf detected in {} at index {}", param_name, global_idx);
+                    }
+                } else if val.abs() > 1e6 {
+                    large_value_count += 1;
+                }
+
+                dest[*offset + i] = val;  // Safe write
+            }
+            *offset += src.len();  // Update offset safely
+        };
+
+        macro_rules! copy_grad {
+            ($name:expr, $param:expr, $param_str:expr) => {
+                check_and_copy(
+                    &mut self.grads_memory,
+                    &$param,
+                    $param_str,
+                    &mut offset,
+                );
+            };
+        }
+
+        // Use the macro for all params
+        copy_grad!(0, self.grads.wte, "wte");
+        copy_grad!(1, self.grads.wpe, "wpe");
+        copy_grad!(2, self.grads.ln1w, "ln1w");
+        copy_grad!(3, self.grads.ln1b, "ln1b");
+        copy_grad!(4, self.grads.qkvw, "qkvw");
+        copy_grad!(5, self.grads.qkvb, "qkvb");
+        copy_grad!(6, self.grads.attprojw, "attprojw");
+        copy_grad!(7, self.grads.attprojb, "attprojb");
+        copy_grad!(8, self.grads.ln2w, "ln2w");
+        copy_grad!(9, self.grads.ln2b, "ln2b");
+        copy_grad!(10, self.grads.fcw, "fcw");
+        copy_grad!(11, self.grads.fcb, "fcb");
+        copy_grad!(12, self.grads.fcprojw, "fcprojw");
+        copy_grad!(13, self.grads.fcprojb, "fcprojb");
+        copy_grad!(14, self.grads.lnfw, "lnfw");
+        copy_grad!(15, self.grads.lnfb, "lnfb");
+
+        // Log any anomalies found
+        if nan_count > 0 || inf_count > 0 || large_value_count > 0 {
+            println!(
+                "Gradient Check Warning: NaNs: {}, Infs: {}, Large Values: {}",
+                nan_count, inf_count, large_value_count
+            );
+        }
+
+        // Log the maximum gradient value and its location
+        if let Some(param_name) = max_param_name {
+            println!(
+                "Max Gradient Value: {} at Index: {} in {}",
+                max_val, max_idx, param_name
+            );
+        } else {
+            println!("Max Gradient Value: {} at Index: {} (Unknown Parameter)", max_val, max_idx);
+        }
+    }
+
+
 
 
     pub fn update(&mut self, learning_rate: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32, t: usize) {
@@ -2074,7 +2194,11 @@ fn main() {
     // training variables
     //let rng_state = 1337;
     const GEN_MAX_LENGTH: usize = 64; // move the const above
-    //let mut gen_tokens = [0; GEN_MAX_LENGTH];
+    let mut gen_tokens = [0; GEN_MAX_LENGTH];
+
+    // CHECK VS C
+    // println!("First few wte values (Rust): {:?}", &model.params.wte[..10]);
+
     // init of the model
     model.mean_loss = 0.0;
     for step in 0..2{
@@ -2083,22 +2207,32 @@ fn main() {
         // TODO CREATE THE INFERENCE PART
         // Training step
         train_loader.reset();
-        for _ in 0..train_loader.num_batches {
+        for batch_idx in 0..train_loader.num_batches {
+            println!("Batch {} over {}", batch_idx, train_loader.num_batches);
             train_loader.next_batch();
-            model.zero_grad();
+            // println!("Loaded tokens: {:?}", &train_loader.inputs[..10]);
+
             let starter = Instant::now();
             model.forward(&train_loader.inputs, Some(&train_loader.targets), B, T);
+            model.zero_grad();
             let end_time = starter.elapsed();
             println!("Time taken for forward pass: {:?}", end_time);
             println!("train loss: {}", model.mean_loss);
             println!("Backward");
             let starter = Instant::now();
             model.backward();
+            //model.update_grads_memory();  // Ensure gradients are collected
             let end_time = starter.elapsed();
             println!("Time taken for backward pass: {:?}", end_time);
-            let grad_mean: f32 = model.grads_memory.iter().sum::<f32>() / model.grads_memory.len() as f32;
-            println!("Gradient mean: {}", grad_mean);
-            println!("Update");
+            //let grad_mean: f32 = model.grads_memory.iter().sum::<f32>() / model.grads_memory.len() as f32;
+            // println!("Gradient mean: {}", grad_mean);
+            // println!("Gradient sum {:?}", model.grads_memory.iter().sum::<f32>());
+            // println!("Gradient memory len {:?}", model.grads_memory.len());
+            // println!("Update");
+
+            // println!("Loss (Rust): {:.6}", model.mean_loss);
+            // println!("First few logits gradients (Rust): {:?}", &model.grads_acts.logits[..10]);
+
             model.update(1e-4, 0.9, 0.999, 1e-8, 0.0, step+1);
         }
         println!("validation");
