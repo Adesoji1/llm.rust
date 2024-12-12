@@ -1240,9 +1240,9 @@ impl GPT2 {
                 & mut residual,
                 &l_ln1w,  // weight for layernorm
                 &l_ln1b,  // bias for layernorm
-                self.batch_size,
-                self.seq_len,
-                self.config.channels
+                b,
+                t,
+                c
             );
             // println!("Executing matmul forward pass");
             // let start = Instant::now();
@@ -2167,9 +2167,8 @@ fn print_model_summary(model: &GPT2) {
     // If you have other vectors or arrays, you can add similar print statements here
 }
 fn main() {
-    // Set up Rayon to use a specific number of threads
-    //rayon::ThreadPoolBuilder::new().num_threads(4).build_global().unwrap();
-
+    // Set up Rayon to use a specific number of threads, this must be either the same as openblas or 1
+    rayon::ThreadPoolBuilder::new().num_threads(8).build_global().unwrap();
 
     let mut model = GPT2::new();
     let checkpoint_path = Path::new("/Users/stefano.bosisio/Documents/llm.rust/gpt2_124M.bin");
@@ -2182,7 +2181,7 @@ fn main() {
     let tiny_shakespeare_val: &Path = Path::new("/Users/stefano.bosisio/Documents/llm.rust/data/tiny_shakespeare_val.bin");
     // initialise B & T
     let B: usize = 4;
-    let T: usize = 1024;
+    let T: usize = 64; // max 1024
     let val_num_batches = 10;
     // train loader
     let mut train_loader: DataLoader = DataLoader::new(tiny_shakespeare_train, B, T).unwrap();
@@ -2201,55 +2200,44 @@ fn main() {
 
     // init of the model
     model.mean_loss = 0.0;
-    for step in 0..2{
+    for step in 0..100{
         // Once in a while estimate the validation loss
         println!("Step: {}", step);
         // TODO CREATE THE INFERENCE PART
         // Training step
-        train_loader.reset();
-        for batch_idx in 0..train_loader.num_batches {
-            println!("Batch {} over {}", batch_idx, train_loader.num_batches);
-            train_loader.next_batch();
-            // println!("Loaded tokens: {:?}", &train_loader.inputs[..10]);
-
-            let starter = Instant::now();
-            model.forward(&train_loader.inputs, Some(&train_loader.targets), B, T);
-            model.zero_grad();
-            let end_time = starter.elapsed();
-            println!("Time taken for forward pass: {:?}", end_time);
-            println!("train loss: {}", model.mean_loss);
-            println!("Backward");
-            let starter = Instant::now();
-            model.backward();
-            //model.update_grads_memory();  // Ensure gradients are collected
-            let end_time = starter.elapsed();
-            println!("Time taken for backward pass: {:?}", end_time);
-            //let grad_mean: f32 = model.grads_memory.iter().sum::<f32>() / model.grads_memory.len() as f32;
-            // println!("Gradient mean: {}", grad_mean);
-            // println!("Gradient sum {:?}", model.grads_memory.iter().sum::<f32>());
-            // println!("Gradient memory len {:?}", model.grads_memory.len());
-            // println!("Update");
-
-            // println!("Loss (Rust): {:.6}", model.mean_loss);
-            // println!("First few logits gradients (Rust): {:?}", &model.grads_acts.logits[..10]);
-
-            model.update(1e-4, 0.9, 0.999, 1e-8, 0.0, step+1);
+        //train_loader.reset();
+        let starter = Instant::now();
+        model.forward(&train_loader.inputs, Some(&train_loader.targets), B, T);
+        model.zero_grad();
+        let end_time = starter.elapsed();
+        println!("Time taken for forward pass: {:?}", end_time);
+        println!("train loss: {}", model.mean_loss);
+        println!("Backward");
+        let starter = Instant::now();
+        model.backward();
+        let end_time = starter.elapsed();
+        println!("Time taken for backward pass: {:?}", end_time);
+        let grad_norm: f32 = model.grads_memory.iter().map(|g| g.abs()).sum();
+        println!("Gradient norm: {:.6}", grad_norm);
+        model.update(1e-4, 0.9, 0.999, 1e-8, 0.0, step+1);
+        train_loader.next_batch();
         }
-        println!("validation");
-        if step % 10 == 0 {
-            let mut val_loss = 0.0;
-            println!("validation reset");
-            val_loader.reset();
-            for _ in 0..val_num_batches {
-                println!("validation nexdt batch ");
-                val_loader.next_batch();
-                println!("model forward for validation");
-                model.forward(&val_loader.inputs, Some(&val_loader.targets), B, T);
-                println!("val loss");
-                val_loss += model.mean_loss;
-            }
-            val_loss /= val_num_batches as f32;
-            println!("val loss: {}", val_loss);
-        }
-    }
+
+
+        // println!("validation");
+        // if step % 10 == 0 {
+        //     let mut val_loss = 0.0;
+        //     println!("validation reset");
+        //     val_loader.reset();
+        //     for _ in 0..val_num_batches {
+        //         println!("validation nexdt batch ");
+        //         val_loader.next_batch();
+        //         println!("model forward for validation");
+        //         model.forward(&val_loader.inputs, Some(&val_loader.targets), B, T);
+        //         println!("val loss");
+        //         val_loss += model.mean_loss;
+        //     }
+        //     val_loss /= val_num_batches as f32;
+        //     println!("val loss: {}", val_loss);
+        // }
 }
