@@ -1316,16 +1316,6 @@ impl GPT2 {
             // println!("Executing matmul forward pass");
             // let start = Instant::now();
             // print first 10 elemetns of l_fch
-            println!("l_fch: {:?}", &l_fch[0..10]);
-            println!("l_ln2: {:?}", &l_ln2[0..10]);
-            println!("l_fcw: {:?}", &l_fcw[0..10]);
-            println!("l_fcb: {:?}", &l_fcb[0..10]);
-            println!("b: {}, t: {}, c: {}", b, t, c);
-            // print l_fch, l_ln2 and l-fcw and l_fcb lenghts
-            println!("l_fch length: {}", l_fch.len());
-            println!("l_ln2 length: {}", l_ln2.len());
-            println!("l_fcw length: {}", l_fcw.len());
-            println!("l_fcb length: {}", l_fcb.len());
             matmul_forward(
                 l_fch,
                 l_ln2,
@@ -1339,7 +1329,7 @@ impl GPT2 {
             // print mean of l_fch
             let mean_fch = l_fch.iter().sum::<f32>() / (b*t*4*c) as f32;
             println!("Mean fch activation (Rust): {:.6}", mean_fch);
-            process::exit(0x0100);
+            //process::exit(0x0100);
             // let duration = start.elapsed();
             // println!("Function took: {:?}", duration);
             // println!("Executing gelu forward pass");
@@ -1369,9 +1359,18 @@ impl GPT2 {
             // let duration = start.elapsed();
             // println!("Function took: {:?}", duration);
             // println!("Executing residual forward pass");
+            // print the mean of l_residual3
+            let mean_residual3 = l_residual3.iter().sum::<f32>() / l_residual3.len() as f32;
+            println!("2 Mean residual3 activation (Rust): {:.6}", mean_residual3);
+            // the mean of l_ln2
+            let mean_ln2 = l_ln2.iter().sum::<f32>() / l_ln2.len() as f32;
+            println!("2 Mean ln2 activation (Rust): {:.6}", mean_ln2);
+            // of l_fcproj
+            let mean_fcproj = l_fcproj.iter().sum::<f32>() / l_fcproj.len() as f32;
+            println!("2 Mean fcproj activation (Rust): {:.6}", mean_fcproj);
             residual_forward(
                 l_residual3,
-                l_ln2,
+                &l_residual2,
                 l_fcproj,
                 b*t*c);
             // print mean of l_residual3
