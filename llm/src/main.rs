@@ -8,6 +8,7 @@ use std::time::Instant;
 use atomic_float::AtomicF32;
 use std::sync::atomic::Ordering;
 use std::process;
+use rand::Rng;
 use cblas::{sgemm, Layout, Transpose};
 use rayon::prelude::*;
 
@@ -21,6 +22,7 @@ Here's how you can modify the code using rayon and Mutex */
 
 const NUM_PARAMETER_TENSORS: usize = 16;
 const NUM_ACTIVATION_TENSORS: usize = 23;
+const GPT2_EOT: u32 = 50256;
 
 
 //***** UTILITY FUNCTION **** */
@@ -1162,13 +1164,13 @@ impl GPT2 {
         let wte = &self.params.wte;
         let wpe = &self.params.wpe;
         // first 10 values of input
-        println!("inputs: {:?}", &inputs[0..10]);
+        //println!("inputs: {:?}", &inputs[0..10]);
         // print size of wte and wpe
         encoder_forward(&mut self.acts.encoded, &inputs, &wte, &wpe, b, t, c);
 
         // CHECK RUST VS C
-        let mean_encoded = self.acts.encoded.iter().sum::<f32>() / self.acts.encoded.len() as f32;
-        println!("Mean encoded activation (Rust): {:.6}", mean_encoded);
+        // let mean_encoded = self.acts.encoded.iter().sum::<f32>() / self.acts.encoded.len() as f32;
+        // println!("Mean encoded activation (Rust): {:.6}", mean_encoded);
         // Process each layer
         for l in 0..self.config.num_layers {
             // Get the residual from the previous layer
@@ -1241,8 +1243,8 @@ impl GPT2 {
                 c
             );
             // print the mean value of the l_ln1
-            let mean_ln1 = l_ln1.iter().sum::<f32>() / l_ln1.len() as f32;
-            println!("Mean ln1 activation (Rust): {:.6}", mean_ln1);
+            // let mean_ln1 = l_ln1.iter().sum::<f32>() / l_ln1.len() as f32;
+            // println!("Mean ln1 activation (Rust): {:.6}", mean_ln1);
             // println!("Executing matmul forward pass");
             // let start = Instant::now();
             matmul_forward(
@@ -1256,8 +1258,8 @@ impl GPT2 {
                 3*c
             );
             //print the mean value of l_qkv
-            let mean_qkv = l_qkv.iter().sum::<f32>() / l_qkv.len() as f32;
-            println!("Mean qkv activation (Rust): {:.6}", mean_qkv);
+            // let mean_qkv = l_qkv.iter().sum::<f32>() / l_qkv.len() as f32;
+            // println!("Mean qkv activation (Rust): {:.6}", mean_qkv);
             // let duration = start.elapsed();
             // println!("Function took: {:?}", duration);
             // println!("Executing attention forward pass");
@@ -1271,8 +1273,8 @@ impl GPT2 {
                 c,
                 nh);
             // print mean of l_atty
-            let mean_atty = l_atty.iter().sum::<f32>() / l_atty.len() as f32;
-            println!("Mean atty activation (Rust): {:.6}", mean_atty);
+            // let mean_atty = l_atty.iter().sum::<f32>() / l_atty.len() as f32;
+            // println!("Mean atty activation (Rust): {:.6}", mean_atty);
             // println!("Executing matmul forward pass");
             // let start = Instant::now();
             matmul_forward(
@@ -1285,8 +1287,8 @@ impl GPT2 {
                 c,
                 c);
             //print mean of l_attproj
-            let mean_attproj = l_attproj.iter().sum::<f32>() / l_attproj.len() as f32;
-            println!("Mean attproj activation (Rust): {:.6}", mean_attproj);
+            // let mean_attproj = l_attproj.iter().sum::<f32>() / l_attproj.len() as f32;
+            // println!("Mean attproj activation (Rust): {:.6}", mean_attproj);
             // let duration = start.elapsed();
             // println!("Function took: {:?}", duration);
             // println!("Executing residual forward pass");
@@ -1296,8 +1298,8 @@ impl GPT2 {
                 l_attproj,
                 b*t*c);
             //print mean of l_residual2
-            let mean_residual2 = l_residual2.iter().sum::<f32>() / l_residual2.len() as f32;
-            println!("Mean residual2 activation (Rust): {:.6}", mean_residual2);
+            // let mean_residual2 = l_residual2.iter().sum::<f32>() / l_residual2.len() as f32;
+            // println!("Mean residual2 activation (Rust): {:.6}", mean_residual2);
             // println!("Executing layernorm forward pass");
             layernorm_forward(
                 l_ln2,
@@ -1310,8 +1312,8 @@ impl GPT2 {
                 t,
                 c);
             //print mean of l_ln2
-            let mean_ln2 = l_ln2.iter().sum::<f32>() / l_ln2.len() as f32;
-            println!("Mean ln2 activation (Rust): {:.6}", mean_ln2);
+            // let mean_ln2 = l_ln2.iter().sum::<f32>() / l_ln2.len() as f32;
+            // println!("Mean ln2 activation (Rust): {:.6}", mean_ln2);
 
             // println!("Executing matmul forward pass");
             // let start = Instant::now();
@@ -1327,8 +1329,8 @@ impl GPT2 {
                 4*c);
 
             // print mean of l_fch
-            let mean_fch = l_fch.iter().sum::<f32>() / (b*t*4*c) as f32;
-            println!("Mean fch activation (Rust): {:.6}", mean_fch);
+            // let mean_fch = l_fch.iter().sum::<f32>() / (b*t*4*c) as f32;
+            // println!("Mean fch activation (Rust): {:.6}", mean_fch);
             //process::exit(0x0100);
             // let duration = start.elapsed();
             // println!("Function took: {:?}", duration);
@@ -1338,8 +1340,8 @@ impl GPT2 {
                 l_fch,
                 b*t*4*c);
             // print mean of l_fch_gelu
-            let mean_fch_gelu = l_fch_gelu.iter().sum::<f32>() / l_fch_gelu.len() as f32;
-            println!("Mean fch_gelu activation (Rust): {:.6}", mean_fch_gelu);
+            // let mean_fch_gelu = l_fch_gelu.iter().sum::<f32>() / l_fch_gelu.len() as f32;
+            // println!("Mean fch_gelu activation (Rust): {:.6}", mean_fch_gelu);
 
             // println!("Executing matmul forward pass");
             // let start = Instant::now();
@@ -1353,29 +1355,29 @@ impl GPT2 {
                 4*c,
                 c);
             // print mean of l_fcproj
-            let mean_fcproj = l_fcproj.iter().sum::<f32>() / l_fcproj.len() as f32;
-            println!("Mean fcproj activation (Rust): {:.6}", mean_fcproj);
+            // let mean_fcproj = l_fcproj.iter().sum::<f32>() / l_fcproj.len() as f32;
+            // println!("Mean fcproj activation (Rust): {:.6}", mean_fcproj);
 
             // let duration = start.elapsed();
             // println!("Function took: {:?}", duration);
             // println!("Executing residual forward pass");
             // print the mean of l_residual3
-            let mean_residual3 = l_residual3.iter().sum::<f32>() / l_residual3.len() as f32;
-            println!("2 Mean residual3 activation (Rust): {:.6}", mean_residual3);
-            // the mean of l_ln2
-            let mean_ln2 = l_ln2.iter().sum::<f32>() / l_ln2.len() as f32;
-            println!("2 Mean ln2 activation (Rust): {:.6}", mean_ln2);
-            // of l_fcproj
-            let mean_fcproj = l_fcproj.iter().sum::<f32>() / l_fcproj.len() as f32;
-            println!("2 Mean fcproj activation (Rust): {:.6}", mean_fcproj);
+            // let mean_residual3 = l_residual3.iter().sum::<f32>() / l_residual3.len() as f32;
+            // println!("2 Mean residual3 activation (Rust): {:.6}", mean_residual3);
+            // // the mean of l_ln2
+            // let mean_ln2 = l_ln2.iter().sum::<f32>() / l_ln2.len() as f32;
+            // println!("2 Mean ln2 activation (Rust): {:.6}", mean_ln2);
+            // // of l_fcproj
+            // let mean_fcproj = l_fcproj.iter().sum::<f32>() / l_fcproj.len() as f32;
+            // println!("2 Mean fcproj activation (Rust): {:.6}", mean_fcproj);
             residual_forward(
                 l_residual3,
                 &l_residual2,
                 l_fcproj,
                 b*t*c);
             // print mean of l_residual3
-            let mean_residual3 = l_residual3.iter().sum::<f32>() / l_residual3.len() as f32;
-            println!("Mean residual3 activation (Rust): {:.6}", mean_residual3);
+            // let mean_residual3 = l_residual3.iter().sum::<f32>() / l_residual3.len() as f32;
+            // println!("Mean residual3 activation (Rust): {:.6}", mean_residual3);
         }
         // line 758 of C code
         let residual = &mut self.acts.residual3[(self.config.num_layers - 1)*self.batch_size * self.seq_len * self.config.channels..].to_vec();
@@ -1390,8 +1392,8 @@ impl GPT2 {
             t,
             c);
         // print mean of self.acts.lnf
-        let mean_lnf = self.acts.lnf.iter().sum::<f32>() / self.acts.lnf.len() as f32;
-        println!("Mean lnf activation (Rust): {:.6}", mean_lnf);
+        // let mean_lnf = self.acts.lnf.iter().sum::<f32>() / self.acts.lnf.len() as f32;
+        // println!("Mean lnf activation (Rust): {:.6}", mean_lnf);
         // let start = Instant::now();
         matmul_forward(&mut self.acts.logits,
             &mut self.acts.lnf,
@@ -1402,8 +1404,8 @@ impl GPT2 {
             c,
             v);
         // print mean of self.acts.logits
-        let mean_logits = self.acts.logits.iter().sum::<f32>() / self.acts.logits.len() as f32;
-        println!("Mean logits activation (Rust): {:.6}", mean_logits);
+        // let mean_logits = self.acts.logits.iter().sum::<f32>() / self.acts.logits.len() as f32;
+        // println!("Mean logits activation (Rust): {:.6}", mean_logits);
         // let duration = start.elapsed();
         // println!("Function took: {:?}", duration);
         softmax_forward(&mut self.acts.probs,
@@ -1412,8 +1414,8 @@ impl GPT2 {
             t,
             v);
         // print mean of self.acts.probs
-        let mean_probs = self.acts.probs.iter().sum::<f32>() / self.acts.probs.len() as f32;
-        println!("Mean probs activation (Rust): {:.6}", mean_probs);
+        // let mean_probs = self.acts.probs.iter().sum::<f32>() / self.acts.probs.len() as f32;
+        // println!("Mean probs activation (Rust): {:.6}", mean_probs);
         // line 764
         if let Some(targets) = targets {
             crossentropy_forward(&mut self.acts.losses, &self.acts.probs, targets, b, t, v);
@@ -1517,6 +1519,9 @@ impl GPT2 {
             t,
             v,
         );
+        // // print mean of dlogits
+        // let mean_dlogits = self.grads_acts.logits.iter().sum::<f32>() / self.grads_acts.logits.len() as f32;
+        // println!("Mean dlogits activation (Rust): {:.6}", mean_dlogits);
 
         // Backprop into lnf and wte
         {
@@ -1540,6 +1545,9 @@ impl GPT2 {
                 c,
                 v,
             );
+            // // print mean of local_lnf
+            // let mean_local_logits = local_logits.iter().sum::<f32>() / local_logits.len() as f32;
+            // println!("Mean local_lnf activation (Rust): {:.6}", mean_local_logits);
 
             // Copy results back
             self.grads_acts.lnf.copy_from_slice(&local_lnf);
@@ -1576,6 +1584,9 @@ impl GPT2 {
                 t,
                 c,
             );
+            // // print mean of local_dresidual
+            // let mean_local_dlnf = local_dlnf.iter().sum::<f32>() / local_dlnf.len() as f32;
+            // println!("Mean local_dlnf activation (Rust): {:.6}", mean_local_dlnf);
 
             // Copy updated values back
             self.grads_acts.residual3[residual_start..residual_end].copy_from_slice(&local_dresidual);
@@ -1606,6 +1617,9 @@ impl GPT2 {
                 let mut local_residual3 = self.grads_acts.residual3[start_bt_c..end_bt_c].to_vec();
 
                 residual_backward(&mut local_residual2, &mut local_fcproj, &mut local_residual3, b*t*c);
+                // // print mean of local_residual2
+                // let mean_local_residual3 = local_residual3.iter().sum::<f32>() / local_residual3.len() as f32;
+                // println!("Mean local_residual3 activation (Rust): {:.6}", mean_local_residual3);
 
                 // Copy back
                 self.grads_acts.residual2[start_bt_c..end_bt_c].copy_from_slice(&local_residual2);
@@ -1644,6 +1658,9 @@ impl GPT2 {
                         l_fcprojw,
                         b, t, 4*c, c
                     );
+                    // // print mean of local_fcprojw
+                    // let mean_local_fcproj = local_fcproj.iter().sum::<f32>() / local_fcproj.len() as f32;
+                    // println!("Mean local_fcproj activation (Rust): {:.6}", mean_local_fcproj);
 
                     // copy fcprojw, fcprojb back
                     self.grads.fcprojw[layer_idx * c * 4 * c..(layer_idx + 1)*c*4*c].copy_from_slice(&local_fcprojw);
@@ -1654,6 +1671,9 @@ impl GPT2 {
                 {
                     let l_fch = &self.acts.fch[fch_range.clone()];
                     gelu_backward(&mut local_fch, l_fch, &mut local_fch_gelu, b*t*4*c);
+
+                    // let mean_local_fch_gelu = local_fch_gelu.iter().sum::<f32>() / local_fch_gelu.len() as f32;
+                    // println!("Mean local_fch_gelu activation (Rust): {:.6}", mean_local_fch_gelu);
                 }
 
                 // fcw backward
@@ -1670,6 +1690,8 @@ impl GPT2 {
                         l_fcw,
                         b, t, c, 4*c
                     );
+                    // let mean_local_fch = local_fch.iter().sum::<f32>() / local_fch.len() as f32;
+                    // println!("Mean local_fch activation (Rust): {:.6}", mean_local_fch);
 
                     // copy fcw,fcb back
                     self.grads.fcw[layer_idx * 4 * c * c..(layer_idx+1)*4*c*c].copy_from_slice(&local_fcw);
@@ -1899,6 +1921,9 @@ impl GPT2 {
             );
             // If encoder_backward modifies encoded grads in place, copy back as needed.
             self.grads_acts.encoded.copy_from_slice(&local_encoded);
+
+            // let local_encoded_mean = local_encoded.iter().sum::<f32>() / local_encoded.len() as f32;
+            // println!("Mean local_encoded activation (Rust): {:.6}", local_encoded_mean);
         }
         //let end_time = start_time.elapsed();
         //println!("Time taken for encoder backward pass: {:?}", end_time);
@@ -2074,6 +2099,32 @@ impl GPT2 {
 
 }
 /* END OF GPT2 CONFIGURATION */
+
+/* INFERENCE */
+
+fn random_u32(state: &mut u64) -> u32 {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    ((*state).wrapping_mul(0x2545_F491_4F6C_DD1D)) as u32
+}
+
+fn random_f32(state: &mut u64) -> f32 {
+    (random_u32(state) >> 8) as f32 / 16_777_216.0
+}
+
+fn sample_mult(probabilities: &[f32], coin: f32) -> usize {
+    let mut cdf = 0.0;
+    for (i, &prob) in probabilities.iter().enumerate() {
+        cdf += prob;
+        if coin < cdf {
+            return i;
+        }
+    }
+    probabilities.len() - 1
+}
+
+/* END INFERENCE */
 
 fn gpt2_build_from_checkpoint(model: &mut GPT2, checkpoint_path: &Path) -> io::Result<()> {
     // Open the model file
@@ -2261,14 +2312,15 @@ fn main() {
     //let rng_state = 1337;
     const GEN_MAX_LENGTH: usize = 64; // move the const above
     let mut gen_tokens = [0; GEN_MAX_LENGTH];
+    let mut rng_state = 1337;
 
     // CHECK VS C
     // println!("First few wte values (Rust): {:?}", &model.params.wte[..10]);
 
     // init of the model
     model.mean_loss = 0.0;
-    for step in 0..100{
-        // Once in a while estimate the validation loss
+    for step in 0..200{
+
         println!("Step: {}", step);
         // TODO CREATE THE INFERENCE PART
         // Training step
@@ -2290,23 +2342,47 @@ fn main() {
         let grad_norm: f32 = model.grads_memory.iter().map(|g| g.abs()).sum();
         println!("Gradient norm: {:.6}", grad_norm);
         model.update(1e-4, 0.9, 0.999, 1e-8, 0.0, step+1);
+
+
+        // estimate the validation loss
+        if step % 10 == 0 {
+            println!("Validation");
+            let mut val_loss = 0.0;
+            val_loader.reset();
+            for _ in 0..val_num_batches {
+                val_loader.next_batch();
+                model.forward(&val_loader.inputs, Some(&val_loader.targets), B, T);
+                val_loss += model.mean_loss;
+            }
+            val_loss /= val_num_batches as f32;
+            println!("val loss: {}", val_loss);
         }
 
+        // and do inference as well
+        if (step > 0 && step % 10 == 0 ) {
+            println!("Inference");
+            gen_tokens[0] = GPT2_EOT;
+            for tt in 1 .. GEN_MAX_LENGTH {
+                let gen_tokens_i32: Vec<i32> = gen_tokens[..tt].iter().map(|&x| x as i32).collect();
+                model.forward(&gen_tokens_i32, None, 1, tt);
 
-        // println!("validation");
-        // if step % 10 == 0 {
-        //     let mut val_loss = 0.0;
-        //     println!("validation reset");
-        //     val_loader.reset();
-        //     for _ in 0..val_num_batches {
-        //         println!("validation nexdt batch ");
-        //         val_loader.next_batch();
-        //         println!("model forward for validation");
-        //         model.forward(&val_loader.inputs, Some(&val_loader.targets), B, T);
-        //         println!("val loss");
-        //         val_loss += model.mean_loss;
-        //     }
-        //     val_loss /= val_num_batches as f32;
-        //     println!("val loss: {}", val_loss);
-        // }
+                let probs_start = (tt-1) * model.config.vocab_size;
+                let probs = &model.acts.probs[probs_start..probs_start + model.config.vocab_size];
+
+                //let normalized_probs = probs.iter().map(|&p| p / (probs.iter().sum())).collect::<Vec<f32>>();
+                let coin = random_f32(&mut rng_state);
+                let next_token = sample_mult(&probs, coin);
+
+                gen_tokens[tt] = next_token as u32;
+                // if next_token == 50257 {
+                //     break;
+                // }
+            }
+            println!("Generated text:");
+            for ttt in 0..GEN_MAX_LENGTH {
+                let token = gen_tokens[ttt];
+                print!("{} ", token);
+            }
+        }
+    }
 }
