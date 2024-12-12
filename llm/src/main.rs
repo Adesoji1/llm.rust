@@ -724,8 +724,8 @@ fn gelu_backward(dinp: &mut [f32], inp: &[f32], dout: &mut [f32], n: usize) {
         let tanh_out = (tanh_arg).tanh();
         let coshf_out = (tanh_arg).cosh();
         let sech_out = 1.0 / (coshf_out*coshf_out);
-        let local_grad = 0.5  * ( 1.0 + tanh_out) + x * 0.5 * sech_out * s * (1.0 + 3.0 + 0.044715*x*x);
-        dinp[i] += local_grad + dout[i];
+        let local_grad = 0.5  * ( 1.0 + tanh_out) + x * 0.5 * sech_out * s * (1.0 + 3.0 * 0.044715*x*x);
+        dinp[i] += local_grad * dout[i];
     }
 }
 
