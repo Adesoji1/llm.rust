@@ -2361,7 +2361,7 @@ fn main() {
 
     // init of the model
     model.mean_loss = 0.0;
-    for step in 0..200{
+    for step in 0..2000{
 
         println!("Step: {}", step);
         // Training step
@@ -2394,9 +2394,9 @@ fn main() {
             for _ in 0..val_num_batches {
                 val_loader.next_batch();
                 // print first 10 elements of val_loader.inputs
-                println!("First 10 elements of the input: {:?}", &val_loader.inputs[..10]);
+                // println!("First 10 elements of the input: {:?}", &val_loader.inputs[..10]);
                 model.forward(&val_loader.inputs, Some(&val_loader.targets), b, t);
-                println!("!!!! val loss: {}", model.mean_loss);
+                // println!("!!!! val loss: {}", model.mean_loss);
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches as f32;
