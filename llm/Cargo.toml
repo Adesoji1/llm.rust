@@ -12,6 +12,8 @@ ndarray = { version = "0.16.1", features = ["rayon"] }
 blas-src = { version = "0.10.0", features = ["accelerate"] }
 cblas = "0.4.0"
 atomic_float = "1.1.0"
+rand = "0.8.5"
+tokenizers = {version = "0.21.0", features = ["http"]}
 
 [profile.release]
 lto = true
