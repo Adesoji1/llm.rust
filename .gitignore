@@ -1,1 +1,10 @@
 */target
+matmul/
+matmul_tests/*/target
+matmul_tests/c_code/matmul_example
+matmul_tests/c_code/test_openmp.c
+matmul_backward_tests/*/target
+matmul_backward_tests/c_code/matmul_backward
+matmul_jax/axlearn
+layernorm_forward_tests/*/target
+attention_forward/*/target
