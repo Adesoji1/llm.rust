@@ -3,31 +3,25 @@ use std::fs::File;
 use std::path::Path;
 use byteorder::{ReadBytesExt, LittleEndian};
 use rayon::prelude::*;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Instant;
-use atomic_float::AtomicF32;
-use std::sync::atomic::Ordering;
-use std::process;
-use rand::Rng;
 use cblas::{sgemm, Layout, Transpose};
-use rayon::prelude::*;
-use tokenizers::tokenizer::{Tokenizer, Result};
+use tokenizers::tokenizer::Tokenizer;
 
-/*Exaplanation for mutex
- rayon expects the data being mutated to be isolated per iteration to avoid data races. Since out is a mutable reference that multiple threads attempt to access simultaneously, Rust prevents this to ensure safety.
+/*Explanation for mutex
+ rayon expects the data being mutated to be isolated per iteration to avoid data races.
+ Since out is a mutable reference that multiple threads attempt to access simultaneously, Rust prevents this to ensure safety.
 
  use rayon's Mutex or Atomic types to handle concurrent writes to shared data. Here, using Mutex around the out array is appropriate since we're writing to different parts of the array concurrently. Each thread will lock the Mutex to write its results.
-
-Here's how you can modify the code using rayon and Mutex */
+*/
 
 const NUM_PARAMETER_TENSORS: usize = 16;
-const NUM_ACTIVATION_TENSORS: usize = 23;
 const GPT2_EOT: u32 = 50256;
 
 
 //***** UTILITY FUNCTION **** */
 fn encoder_forward(out: &mut [f32], inp: &[i32], wte: &[f32], wpe: &[f32], b: usize, t: usize, c: usize) {
-    //println!("b: {}, t: {}, c: {}", b, t, c);
+
     for b_idx in 0..b {
         for t_idx in 0..t {
             let out_start_idx = b_idx * t * c + t_idx * c;
@@ -64,6 +58,7 @@ fn encoder_backward(dwte: &mut [f32], dwpe: &mut [f32], dout: &[f32], inp: &[i32
     }
 }
 
+//******* GPT2 functions *****/
 fn layernorm_forward(
     out: &mut [f32],
     mean: &mut [f32],
@@ -169,10 +164,10 @@ fn matmul_forward(
     inp: &[f32],
     weight: &[f32],
     bias: Option<&[f32]>,
-    b: usize,   // Batch size
-    t: usize,   // Time steps or sequence length
-    c: usize,   // Input channels
-    oc: usize,  // Output channels
+    b: usize,
+    t: usize,
+    c: usize,
+    oc: usize,
 ) {
     let m = (b * t) as i32; // Number of rows of the output matrix
     let k = c as i32;       // Number of columns of the input matrix / rows of the weight matrix
@@ -189,7 +184,7 @@ fn matmul_forward(
     unsafe {
         sgemm(
             Layout::RowMajor,
-            Transpose::None, // Transpose of A ('N' for no transpose)
+            Transpose::None, // A
             Transpose::Ordinary, // Transpose of B
             m,
             n,
@@ -224,10 +219,10 @@ fn matmul_backward_blas(
     dout: &[f32],
     inp: &[f32],
     weight: &[f32],
-    b: usize,   // Batch size
-    t: usize,   // Time steps or sequence length
-    c: usize,   // Input channels
-    oc: usize,  // Output channels
+    b: usize,
+    t: usize,
+    c: usize,
+    oc: usize,
 ) {
     use cblas::{sgemm, Layout, Transpose};
 
@@ -289,59 +284,6 @@ fn matmul_backward_blas(
             dbias[o] += sum;
         }
     }
-}
-
-fn matmul_backward(
-    dinp: &mut [f32],
-    dweight: &mut [f32],
-    dbias: Option<&[AtomicF32]>,
-    dout: &[f32],
-    inp: &[f32],
-    weight: &[f32],
-    B: usize,
-    T: usize,
-    C: usize,
-    OC: usize,
-) {
-    println!("dinp");
-    // Backward into dinp (same as before)
-    dinp.par_chunks_mut(C)
-        .zip(dout.par_chunks(OC))
-        .for_each(|(dinp_bt, dout_bt)| {
-            for o in 0..OC {
-                let wrow = &weight[o * C..(o + 1) * C];
-                let d = dout_bt[o];
-                for i in 0..C {
-                    dinp_bt[i] += wrow[i] * d;
-                }
-            }
-        });
-
-    println!("dweight");
-    // Backward into dweight and dbias with atomic dbias
-    dweight
-        .par_chunks_mut(C)
-        .enumerate()
-        .for_each(|(o, dwrow)| {
-            let mut dbias_o = 0.0f32;
-            for b in 0..B {
-                for t in 0..T {
-                    let idx = b * T + t;
-                    let dout_bt = &dout[idx * OC..(idx + 1) * OC];
-                    let inp_bt = &inp[idx * C..(idx + 1) * C];
-                    let d = dout_bt[o];
-                    dbias_o += d;
-                    for i in 0..C {
-                        dwrow[i] += inp_bt[i] * d;
-                    }
-                }
-            }
-            // Update dbias using atomic operation
-            if let Some(dbias) = &dbias {
-                dbias[o].fetch_add(dbias_o, Ordering::Relaxed);
-            }
-        });
-    println!("done");
 }
 
 
@@ -512,15 +454,15 @@ fn attention_backward(
                 let dpreatt_bth = &mut local_dpreatt[preatt_start..preatt_start + valid_len];
                 let dout_bth = &dout[dout_offset..dout_offset + hs];
 
-                let mut K_mat = vec![0.0f32; valid_len * hs];
-                let mut V_mat = vec![0.0f32; valid_len * hs];
+                let mut k_mat = vec![0.0f32; valid_len * hs];
+                let mut v_mat = vec![0.0f32; valid_len * hs];
 
                 for t2 in 0..valid_len {
                     let base = b_idx * t * c3 + t2 * c3 + h_idx * hs;
                     let key_row = &inp[base + c..base + c + hs];
                     let val_row = &inp[base + 2 * c..base + 2 * c + hs];
-                    K_mat[t2 * hs..(t2 + 1) * hs].copy_from_slice(key_row);
-                    V_mat[t2 * hs..(t2 + 1) * hs].copy_from_slice(val_row);
+                    k_mat[t2 * hs..(t2 + 1) * hs].copy_from_slice(key_row);
+                    v_mat[t2 * hs..(t2 + 1) * hs].copy_from_slice(val_row);
                 }
 
                 for t2 in 0..valid_len {
@@ -544,15 +486,15 @@ fn attention_backward(
                 let mut dpreatt_scaled = dpreatt_bth.to_vec();
                 dpreatt_scaled.iter_mut().for_each(|x| *x *= scale);
 
-                let mut dQ = vec![0.0f32; hs];
+                let mut dq = vec![0.0f32; hs];
                 for t2 in 0..valid_len {
                     let dp = dpreatt_scaled[t2];
                     for i in 0..hs {
-                        dQ[i] += K_mat[t2 * hs + i] * dp;
+                        dq[i] += k_mat[t2 * hs + i] * dp;
                     }
                 }
                 for i in 0..hs {
-                    local_dinp[query_start + i] += dQ[i];
+                    local_dinp[query_start + i] += dq[i];
                 }
 
                 for t2 in 0..valid_len {
@@ -593,86 +535,6 @@ fn attention_backward(
     dinp.copy_from_slice(&global_dinp.lock().unwrap());
     datt.copy_from_slice(&global_datt.lock().unwrap());
     dpreatt.copy_from_slice(&global_dpreatt.lock().unwrap());
-}
-
-
-fn attention_backward_1(
-    dinp: &mut [f32],
-    dpreatt: &mut [f32],
-    datt: &mut [f32],
-    dout: &[f32],
-    inp: &[f32],
-    att: &[f32],
-    b: usize,
-    t: usize,
-    c: usize,
-    nh: usize,
-) {
-    let c3 = c * 3;
-    let hs = c / nh;
-    let scale = 1.0 / (hs as f32).sqrt();
-
-    dpreatt.fill(0.0);
-    datt.fill(0.0);
-    // If needed, zero out dinp as well:
-    // dinp.fill(0.0);
-
-    for b_idx in 0..b {
-        for t_idx in 0..t {
-            for h in 0..nh {
-                // Index computations
-                let att_start = b_idx * nh * t * t + h * t * t + t_idx * t;
-                let preatt_start = att_start;
-                let query_start = b_idx * t * c3 + t_idx * c3 + h * hs;
-                let valid_len = t_idx + 1;
-
-                let att_bth = &att[att_start..att_start + t];
-                let datt_bth = &mut datt[att_start..att_start + t];
-                let dpreatt_bth = &mut dpreatt[preatt_start..preatt_start + t];
-
-                let dout_offset = b_idx * t * c + t_idx * c + h * hs;
-                // dout_bth: reference to output gradient for this head/time
-                let dout_bth = &dout[dout_offset .. dout_offset + hs];
-
-                // STEP 1: Backprop through value accumulation
-                // forward: out_bth[i] += att_bth[t2] * value_t2[i]
-                // backward:
-                // datt_bth[t2] += value_t2[i] * dout_bth[i]
-                // dvalue_t2[i] += att_bth[t2] * dout_bth[i]
-                for t2 in 0..valid_len {
-                    let value_t2_start = b_idx * t * c3 + t2 * c3 + h * hs + c * 2; // +C*2 for value
-                    for i in 0..hs {
-                        datt_bth[t2] += inp[value_t2_start + i] * dout_bth[i];
-                        dinp[value_t2_start + i] += att_bth[t2] * dout_bth[i];
-                    }
-                }
-
-                // STEP 2: Backprop through softmax
-                // dpreatt_bth[t3] += sum_t2 att_bth[t2]*(indicator(t2==t3)-att_bth[t3])*datt_bth[t2]
-                for t2 in 0..valid_len {
-                    for t3 in 0..valid_len {
-                        let indicator = if t2 == t3 {1.0f32} else {0.0f32};
-                        let local_derivative = att_bth[t2]*(indicator - att_bth[t3]);
-                        dpreatt_bth[t3] += local_derivative * datt_bth[t2];
-                    }
-                }
-
-                // STEP 3: Backprop through preatt = scale*(query⋅key)
-                // dquery[i] += key[i]*dpreatt_bth[t2]*scale
-                // dkey[i]   += query[i]*dpreatt_bth[t2]*scale
-                for t2 in 0..valid_len {
-                    let key_t2_start = b_idx * t * c3 + t2 * c3 + h * hs + c; // +c for key
-                    let dp = dpreatt_bth[t2]*scale;
-                    for i in 0..hs {
-                        // update dquery
-                        dinp[query_start + i] += inp[key_t2_start + i]*dp;
-                        // update dkey
-                        dinp[key_t2_start + i] += inp[query_start + i]*dp;
-                    }
-                }
-            }
-        }
-    }
 }
 
 
@@ -796,8 +658,8 @@ struct DataLoader {
     file_size: u64,
     current_position: u64,
     batch: Vec<i32>,
-    inputs: Vec<i32>,  // Owned vector
-    targets: Vec<i32>, // Owned vector
+    inputs: Vec<i32>,
+    targets: Vec<i32>,
     num_batches: usize,
 }
 
@@ -923,15 +785,14 @@ struct GPT2 {
     m_memory: Vec<f32>,
     v_memory: Vec<f32>,
     acts: ActivationTensors,
-    act_sizes: Vec<usize>,
     acts_memory: Vec<f32>,
     num_activations: usize,
     grads_acts: ActivationTensors,
     grads_acts_memory: Vec<f32>,
     batch_size: usize,
     seq_len: usize,
-    inputs: Vec<i32>, // Vector of integers
-    targets: Vec<i32>, // Vector of integers
+    inputs: Vec<i32>,
+    targets: Vec<i32>,
     mean_loss: f32,
 }
 
@@ -1012,7 +873,6 @@ impl GPT2 {
                 probs: Vec::new(),
                 losses: Vec::new(),
             },
-            act_sizes: vec![0; NUM_ACTIVATION_TENSORS],
             acts_memory: Vec::new(),
             num_activations: 0,
             grads_acts: ActivationTensors {
@@ -1125,6 +985,7 @@ impl GPT2 {
         self.grads_acts.probs.resize(b * t * v, 0.0);
         self.grads_acts.losses.resize(b * t, 0.0);
     }
+
     /* FORWARD PASS */
     pub fn forward(&mut self, inputs: &[i32], targets: Option<&[i32]>, b: usize, t: usize) -> io::Result<()> {
         // Ensure the model is properly initialized
@@ -1943,26 +1804,11 @@ impl GPT2 {
         }
 
         let mut offset = 0; // Tracks the current position in `grads_memory`
-        let mut nan_count = 0;
-        let mut inf_count = 0;
-        let mut large_value_count = 0;
-
-        let mut max_val = f32::MIN;
-        let mut max_idx = 0;
-        let mut max_param_name: Option<String> = None;
-
-        /// Helper closure to copy gradients from a specific parameter to `grads_memory`.
-        /// It also updates anomaly counters and tracks the maximum gradient.
-        let mut check_and_copy = |dest: &mut [f32],
+        // Helper closure to copy gradients from a specific parameter to `grads_memory`.
+        let check_and_copy = | dest: &mut [f32],
                                    src: &[f32],
                                    param_name: &str,
-                                   offset: &mut usize,
-                                   max_val: &mut f32,
-                                   max_idx: &mut usize,
-                                   max_param_name: &mut Option<String>,
-                                   nan_count: &mut usize,
-                                   inf_count: &mut usize,
-                                   large_value_count: &mut usize| {
+                                   offset: &mut usize | {
             // Ensure there is enough space in `grads_memory`
             if *offset + src.len() > dest.len() {
                 panic!(
@@ -1976,44 +1822,6 @@ impl GPT2 {
             }
 
             for (i, &val) in src.iter().enumerate() {
-                let global_idx = *offset + i;
-
-                // Update maximum tracking
-                if val.abs() > max_val.abs() {
-                    *max_val = val;
-                    *max_idx = global_idx;
-                    *max_param_name = Some(param_name.to_string());
-
-                    // Log when a new maximum is found
-                    println!(
-                        "New Max Gradient Found: {} in parameter '{}' at grads_memory index {}",
-                        *max_val, param_name, *max_idx
-                    );
-                }
-
-                // Detect anomalies
-                if !val.is_finite() {
-                    if val.is_nan() {
-                        *nan_count += 1;
-                        println!(
-                            "Anomaly Detected: NaN in parameter '{}' at grads_memory index {}",
-                            param_name, global_idx
-                        );
-                    } else {
-                        *inf_count += 1;
-                        println!(
-                            "Anomaly Detected: Inf in parameter '{}' at grads_memory index {}",
-                            param_name, global_idx
-                        );
-                    }
-                } else if val.abs() > 1e6 {
-                    *large_value_count += 1;
-                    println!(
-                        "Anomaly Detected: Large Gradient ({}) in parameter '{}' at grads_memory index {}",
-                        val, param_name, global_idx
-                    );
-                }
-
                 // Copy the gradient value into `grads_memory`
                 dest[*offset + i] = val;
             }
@@ -2030,12 +1838,6 @@ impl GPT2 {
                     $param_grad,
                     $param_name,
                     &mut offset,
-                    &mut max_val,
-                    &mut max_idx,
-                    &mut max_param_name,
-                    &mut nan_count,
-                    &mut inf_count,
-                    &mut large_value_count,
                 );
             };
         }
@@ -2058,28 +1860,6 @@ impl GPT2 {
         copy_grad!(&self.grads.lnfw, "lnfw");
         copy_grad!(&self.grads.lnfb, "lnfb");
 
-        // Log summary of anomalies
-        // if nan_count > 0 || inf_count > 0 || large_value_count > 0 {
-        //     println!(
-        //         "Gradient Anomalies Detected: NaNs = {}, Infs = {}, Large Values = {}",
-        //         nan_count, inf_count, large_value_count
-        //     );
-        // } else {
-        //     println!("No gradient anomalies detected.");
-        // }
-
-        // Log the maximum gradient value and its location
-        // if let Some(ref param_name) = max_param_name {
-        //     println!(
-        //         "Maximum Gradient: {} in parameter '{}' at grads_memory index {}",
-        //         max_val, param_name, max_idx
-        //     );
-        // } else {
-        //     println!(
-        //         "No gradients found to determine the maximum value. Current max_val: {}",
-        //         max_val
-        //     );
-        // }
     }
 
 
@@ -2254,23 +2034,6 @@ fn gpt2_build_from_checkpoint(model: &mut GPT2, checkpoint_path: &Path) -> io::R
     model.params.fcprojb = model.params_memory[offset..offset + model.param_sizes[13]].to_vec(); offset += model.param_sizes[13];
     model.params.lnfw = model.params_memory[offset..offset + model.param_sizes[14]].to_vec(); offset += model.param_sizes[14];
     model.params.lnfb = model.params_memory[offset..offset + model.param_sizes[15]].to_vec(); offset += model.param_sizes[15];
-    // print the first 10 elements for each of those parameters above
-    println!("First 10 elements of wte: {:?}", &model.params.wte[..10]);
-    println!("First 10 elements of wpe: {:?}", &model.params.wpe[..10]);
-    println!("First 10 elements of ln1w: {:?}", &model.params.ln1w[..10]);
-    println!("First 10 elements of ln1b: {:?}", &model.params.ln1b[..10]);
-    println!("First 10 elements of qkvw: {:?}", &model.params.qkvw[..10]);
-    println!("First 10 elements of qkvb: {:?}", &model.params.qkvb[..10]);
-    println!("First 10 elements of attprojw: {:?}", &model.params.attprojw[..10]);
-    println!("First 10 elements of attprojb: {:?}", &model.params.attprojb[..10]);
-    println!("First 10 elements of ln2w: {:?}", &model.params.ln2w[..10]);
-    println!("First 10 elements of ln2b: {:?}", &model.params.ln2b[..10]);
-    println!("First 10 elements of fcw: {:?}", &model.params.fcw[..10]);
-    println!("First 10 elements of fcb: {:?}", &model.params.fcb[..10]);
-    println!("First 10 elements of fcprojw: {:?}", &model.params.fcprojw[..10]);
-    println!("First 10 elements of fcprojb: {:?}", &model.params.fcprojb[..10]);
-    println!("First 10 elements of lnfw: {:?}", &model.params.lnfw[..10]);
-    println!("First 10 elements of lnfb: {:?}", &model.params.lnfb[..10]);
     // Initialize other fields to defaults
     model.acts_memory = Vec::new();
     model.grads_memory = Vec::new();
@@ -2325,7 +2088,6 @@ fn print_model_summary(model: &GPT2) {
         println!("param_sizes[{}] = {}", index, size);
     });
 
-    // If you have other vectors or arrays, you can add similar print statements here
 }
 fn main() {
     // Set up Rayon to use a specific number of threads, this must be either the same as openblas or 1
