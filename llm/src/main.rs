@@ -1986,22 +1986,22 @@ fn gpt2_build_from_checkpoint(model: &mut GPT2, checkpoint_path: &Path) -> io::R
 
     // Calculate and store parameter sizes
     model.param_sizes = vec![
-        v * c,
-        max_t * c,
-        l * c,
-        l * c,
-        l * (3 * c) * c,
-        l * (3 * c),
-        l * c * c,
-        l * c,
-        l * c,
-        l * c,
-        l * (4 * c) * c,
-        l * (4 * c),
-        l * c * (4 * c),
-        l * c,
-        c,
-        c,
+        v * c, // wte
+        max_t * c, // wpe
+        l * c, // ln1w
+        l * c, // ln1b
+        l * (3 * c) * c,// qkvw
+        l * (3 * c), // qkvb
+        l * c * c, // attprojw
+        l * c, // attprojb
+        l * c, // ln2w
+        l * c, // ln2b
+        l * (4 * c) * c, // fcw
+        l * (4 * c), // fcb
+        l * c * (4 * c), // fcprojw
+        l * c, // fcprojb
+        c, // lnfw
+        c, // lnfb
     ];
 
     let num_parameters: usize = model.param_sizes.iter().sum();
@@ -2091,7 +2091,7 @@ fn print_model_summary(model: &GPT2) {
 }
 fn main() {
     // Set up Rayon to use a specific number of threads, this must be either the same as openblas or 1
-    rayon::ThreadPoolBuilder::new().num_threads(8).build_global().unwrap();
+    rayon::ThreadPoolBuilder::new().num_threads(16).build_global().unwrap();
 
     let mut model = GPT2::new();
     let checkpoint_path = Path::new("/Users/stefano.bosisio/Documents/llm.rust/gpt2_124M.bin");
