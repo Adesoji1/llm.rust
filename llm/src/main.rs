@@ -8,6 +8,9 @@ use std::time::Instant;
 use cblas::{sgemm, Layout, Transpose};
 use tokenizers::tokenizer::Tokenizer;
 
+use std::io::{Write, BufWriter};
+use std::error::Error;
+
 /*Explanation for mutex
  rayon expects the data being mutated to be isolated per iteration to avoid data races.
  Since out is a mutable reference that multiple threads attempt to access simultaneously, Rust prevents this to ensure safety.
@@ -2089,7 +2092,7 @@ fn print_model_summary(model: &GPT2) {
     });
 
 }
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     // Set up Rayon to use a specific number of threads, this must be either the same as openblas or 1
     rayon::ThreadPoolBuilder::new().num_threads(16).build_global().unwrap();
 
@@ -2123,8 +2126,9 @@ fn main() {
 
     // init of the model
     model.mean_loss = 0.0;
-    for step in 0..2000{
+    let mut train_losses = Vec::new();
 
+    for step in 0..20{
         println!("Step: {}", step);
         // Training step
         //train_loader.reset();
@@ -2137,6 +2141,7 @@ fn main() {
         let end_time = starter.elapsed();
         println!("Time taken for forward pass: {:?}", end_time);
         println!("train loss: {}", model.mean_loss);
+        train_losses.push(model.mean_loss);
         //println!("Backward");
         let starter = Instant::now();
         model.backward();
@@ -2196,4 +2201,15 @@ fn main() {
             }
         }
     }
+
+    let file = File::create("training_losses.txt")?;
+    let mut writer = BufWriter::new(file);
+
+    for loss in &train_losses {
+        writeln!(writer, "{}", loss)?;
+    }
+
+    println!("Losses have been written to training_losses.txt");
+
+    Ok(())
 }
