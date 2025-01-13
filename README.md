@@ -15,6 +15,22 @@ python prepro_tinyshakespeare.py
 ```
 This will download the input corpus in a `data` folder. The text is convert the input text to input training and validation tokens (`tiny_shakespeare_train.bin` and `tiny_shakespeare_val.bin` respectively). The text is tokenised with GPT-2 tokenizer.
 
+Then you need the starting points for the GPT weights: 
+```bash 
+python prepare_checkpoint.py 
+```
+
+In case you may have this error: 
+```
+Traceback (most recent call last):
+  File "/Users/sbosisio/Documents/llm.rust/prepare_checkpoint.py", line 333, in <module>
+    tokens = torch.from_numpy(tokens)
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Numpy is not available
+```
+Then you can fix it by running `pip install "numpy<2"`. 
+
+
 Then, you can build and run the Rust code on these data with:
 ```bash
 cd llm
